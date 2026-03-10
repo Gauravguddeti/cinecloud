@@ -9,7 +9,8 @@ import Link from "next/link";
 import { motion } from "framer-motion";
 
 export default function HomePage() {
-  const { isAuthenticated, recommendations, recsLoading, recsFromCache, loadRecommendations, user } = useStore();
+  const { isAuthenticated, recommendations, recsLoading, recsFromCache, loadRecommendations, user, ratings } = useStore();
+  const hasRatings = Object.keys(ratings).length > 0;
   const [popular, setPopular] = useState<Movie[]>([]);
   const [hero, setHero] = useState<Movie | null>(null);
   const { setSelectedMovie } = useStore();
@@ -98,7 +99,7 @@ export default function HomePage() {
 
             {recsLoading ? (
               <SkeletonRow />
-            ) : recommendations.length > 0 ? (
+            ) : hasRatings && recommendations.length > 0 ? (
               <HorizontalScroll>
                 {recommendations.map((rec) => (
                   <MovieCard
