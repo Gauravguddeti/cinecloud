@@ -550,6 +550,44 @@ def ratings_get_user(user_id):
         _put_conn(conn)
 
 
+@app.route("/ratings/delete/<movie_id>", methods=["DELETE"])
+def rating_delete(movie_id):
+    uid = _verify_token()
+    if not uid:
+        return _unauth()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM ratings WHERE user_id = %s AND movie_id = %s", (uid, movie_id))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        _put_conn(conn)
+    threading.Thread(target=_recompute_recs, args=(uid,), daemon=True).start()
+    return jsonify({"message": "Rating removed"})
+
+
+@app.route("/ratings/reset", methods=["DELETE"])
+def ratings_reset():
+    uid = _verify_token()
+    if not uid:
+        return _unauth()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM ratings WHERE user_id = %s", (uid,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        _put_conn(conn)
+    threading.Thread(target=_recompute_recs, args=(uid,), daemon=True).start()
+    return jsonify({"message": "All ratings cleared"})
+
+
 # =============================================================
 #  RECOMMENDATIONS
 # =============================================================
@@ -627,9 +665,14 @@ def admin_ingest_status():
 def _run_ingest(pages: int):
     global _ingest_status
     _ingest_status = {"running": True, "total": 0, "message": "fetching genre map..."}
-    # Use a dedicated fresh connection — avoids stale pool connections in background threads
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = None
     try:
+        # Fresh direct connection — avoids stale pool connections in background threads
+        dsn = DATABASE_URL
+        if "sslmode" not in dsn:
+            dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
+        conn = psycopg2.connect(dsn)
+        _ingest_status["message"] = "connected to DB, fetching genre map..."
         genre_map = _fetch_genre_map()
         SOURCES = [
             {"endpoint": "movie/popular",   "language": "en-US", "region": None},
@@ -688,9 +731,10 @@ def _run_ingest(pages: int):
         _ingest_status = {"running": False, "total": total, "message": f"Done — {total} movies in DB"}
     except Exception as e:
         _ingest_status = {"running": False, "total": 0, "message": f"Error: {e}"}
-        print(f"[ingest] {e}")
+        print(f"[ingest] FATAL {type(e).__name__}: {e}")
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 def _flush_batch(conn, movies):

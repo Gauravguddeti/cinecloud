@@ -11,6 +11,8 @@ interface AppState {
   // Ratings
   ratings: Record<string, number>;         // movieId → star rating
   submitRating: (movieId: string, rating: number) => Promise<void>;
+  deleteRating: (movieId: string) => Promise<void>;
+  resetRatings: () => Promise<void>;
   loadRatings: () => Promise<void>;
 
   // Recommendations
@@ -41,6 +43,24 @@ export const useStore = create<AppState>((set, get) => ({
     await ratingsApi.submit(movieId, rating);
     set((state) => ({ ratings: { ...state.ratings, [movieId]: rating } }));
     // Recommendations are refreshed via polling in useRealtimeRecs
+  },
+
+  deleteRating: async (movieId) => {
+    const { user } = get();
+    if (!user) return;
+    await ratingsApi.deleteRating(movieId);
+    set((state) => {
+      const next = { ...state.ratings };
+      delete next[movieId];
+      return { ratings: next };
+    });
+  },
+
+  resetRatings: async () => {
+    const { user } = get();
+    if (!user) return;
+    await ratingsApi.resetRatings();
+    set({ ratings: {}, recommendations: [] });
   },
 
   loadRatings: async () => {

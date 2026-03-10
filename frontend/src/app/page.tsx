@@ -7,10 +7,24 @@ import { MovieCard } from "@/components/MovieCard";
 import type { Movie, Recommendation } from "@/lib/types";
 import Link from "next/link";
 import { motion } from "framer-motion";
+import toast from "react-hot-toast";
 
 export default function HomePage() {
-  const { isAuthenticated, recommendations, recsLoading, recsFromCache, loadRecommendations, user, ratings } = useStore();
+  const { isAuthenticated, recommendations, recsLoading, recsFromCache, loadRecommendations, user, ratings, resetRatings } = useStore();
   const hasRatings = Object.keys(ratings).length > 0;
+
+  const handleStartFresh = async () => {
+    if (!window.confirm("Remove all your ratings and start over? This cannot be undone.")) return;
+    try {
+      await resetRatings();
+      toast.success("All ratings cleared — start fresh!", {
+        duration: 3000,
+        style: { background: "#1a1a1a", color: "#fff", border: "1px solid #ef4444" },
+      });
+    } catch {
+      toast.error("Failed to reset ratings");
+    }
+  };
   const [popular, setPopular] = useState<Movie[]>([]);
   const [hero, setHero] = useState<Movie | null>(null);
   const { setSelectedMovie } = useStore();
@@ -95,6 +109,14 @@ export default function HomePage() {
                   )}
                 </div>
               </div>
+              {hasRatings && (
+                <button
+                  onClick={handleStartFresh}
+                  className="text-xs text-red-400 border border-red-400/40 hover:bg-red-400/10 px-3 py-1.5 rounded-full transition-colors"
+                >
+                  Start Fresh
+                </button>
+              )}
             </div>
 
             {recsLoading ? (

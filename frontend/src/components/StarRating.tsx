@@ -11,7 +11,7 @@ interface StarRatingProps {
 }
 
 export function StarRating({ movieId, size = "md" }: StarRatingProps) {
-  const { ratings, submitRating, isAuthenticated } = useStore();
+  const { ratings, submitRating, deleteRating, isAuthenticated } = useStore();
   const currentRating = ratings[movieId] || 0;
   const [hovered, setHovered] = useState(0);
   const [submitting, setSubmitting] = useState(false);
@@ -33,6 +33,21 @@ export function StarRating({ movieId, size = "md" }: StarRatingProps) {
       });
     } catch {
       toast.error("Failed to submit rating");
+    }
+    setSubmitting(false);
+  };
+
+  const handleRemove = async () => {
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      await deleteRating(movieId);
+      toast.success("Rating removed", {
+        duration: 2000,
+        style: { background: "#1a1a1a", color: "#fff", border: "1px solid #ef4444" },
+      });
+    } catch {
+      toast.error("Failed to remove rating");
     }
     setSubmitting(false);
   };
@@ -62,7 +77,18 @@ export function StarRating({ movieId, size = "md" }: StarRatingProps) {
         </button>
       ))}
       {currentRating > 0 && (
-        <span className="text-xs text-gray-400 ml-1">Your rating: {currentRating}/5</span>
+        <>
+          <span className="text-xs text-gray-400 ml-1">Your rating: {currentRating}/5</span>
+          <button
+            onClick={handleRemove}
+            disabled={submitting}
+            className="ml-1 text-xs text-gray-500 hover:text-red-400 transition-colors disabled:opacity-40"
+            title="Remove rating"
+            aria-label="Remove rating"
+          >
+            ✕
+          </button>
+        </>
       )}
     </div>
   );

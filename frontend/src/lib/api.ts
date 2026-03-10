@@ -74,6 +74,12 @@ export const ratingsApi = {
 
   getUserRatings: (userId: string) =>
     api.get<{ ratings: Rating[]; count: number }>(`/ratings/user/${userId}`),
+
+  deleteRating: (movieId: string) =>
+    api.delete<{ message: string }>(`/ratings/delete/${movieId}`),
+
+  resetRatings: () =>
+    api.delete<{ message: string }>("/ratings/reset"),
 };
 
 // ── Recommendations ───────────────────────────────────────────
