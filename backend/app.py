@@ -589,14 +589,31 @@ def recommendations_refresh(user_id):
 #  ETL — TMDB INGEST
 # =============================================================
 
+def _fetch_genre_map():
+    """Fetch TMDB genre ID→name mapping once for EN and HI."""
+    genre_map = {}
+    for lang in ("en-US", "hi-IN"):
+        r = requests.get(
+            "https://api.themoviedb.org/3/genre/movie/list",
+            params={"api_key": TMDB_API_KEY, "language": lang},
+            timeout=10,
+        )
+        if r.ok:
+            for g in r.json().get("genres", []):
+                genre_map[g["id"]] = g["name"]
+    return genre_map
+
 @app.route("/admin/ingest", methods=["POST"])
 def admin_ingest():
     body  = request.get_json() or {}
-    pages = min(int(body.get("pages", 3)), 50)
+    pages = min(int(body.get("pages", 5)), 50)
     if not TMDB_API_KEY:
         return jsonify({"error": "TMDB_API_KEY not set"}), 500
 
-    # TMDB endpoints to pull from: EN popular, EN top-rated, HI popular (Bollywood), HI top-rated
+    # Fetch genre ID→name map once (2 requests total instead of per-movie)
+    genre_map = _fetch_genre_map()
+
+    # Sources: EN popular, EN top-rated, HI popular (Bollywood), HI top-rated
     SOURCES = [
         {"endpoint": "movie/popular",   "language": "en-US", "region": None},
         {"endpoint": "movie/top_rated", "language": "en-US", "region": None},
@@ -607,52 +624,44 @@ def admin_ingest():
     batch = []
     seen  = set()
     for source in SOURCES:
-      for page in range(1, pages + 1):
-        params = {"api_key": TMDB_API_KEY, "page": page, "language": source["language"]}
-        if source["region"]:
-            params["region"] = source["region"]
-        resp = requests.get(
-            f"https://api.themoviedb.org/3/{source['endpoint']}",
-            params=params,
-            timeout=15,
-        )
-        if not resp.ok:
-            continue
-        for movie in resp.json().get("results", []):
-            mid = str(movie["id"])
-            if mid in seen:
-                continue
-            seen.add(mid)
-            detail = requests.get(
-                f"https://api.themoviedb.org/3/movie/{mid}",
-                params={"api_key": TMDB_API_KEY, "append_to_response": "credits,keywords"},
+        for page in range(1, pages + 1):
+            params = {"api_key": TMDB_API_KEY, "page": page, "language": source["language"]}
+            if source["region"]:
+                params["region"] = source["region"]
+            resp = requests.get(
+                f"https://api.themoviedb.org/3/{source['endpoint']}",
+                params=params,
                 timeout=15,
             )
-            if not detail.ok:
+            if not resp.ok:
                 continue
-            d      = detail.json()
-            genres = [g["name"] for g in d.get("genres", [])]
-            cast   = [c["name"] for c in d.get("credits", {}).get("cast", [])[:10]]
-            kws    = [k["name"] for k in d.get("keywords", {}).get("keywords", [])[:20]]
-            batch.append({
-                "movie_id":       mid,
-                "title":          d.get("title", ""),
-                "title_lower":    d.get("title", "").lower(),
-                "overview":       d.get("overview", ""),
-                "overview_lower": d.get("overview", "").lower(),
-                "genres":         genres,
-                "cast_members":   cast,
-                "cast_search":    " ".join(cast).lower(),
-                "keywords":       kws,
-                "poster_path":    d.get("poster_path"),
-                "backdrop_path":  d.get("backdrop_path"),
-                "release_year":   (d.get("release_date") or "")[:4],
-                "vote_average":   float(d.get("vote_average", 0)),
-                "vote_count":     int(d.get("vote_count", 0)),
-                "popularity":     float(d.get("popularity", 0)),
-                "runtime":        d.get("runtime"),
-                "updated_at":     datetime.utcnow(),
-            })
+            for movie in resp.json().get("results", []):
+                mid = str(movie["id"])
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                # Use the list-page data directly — no per-movie detail call needed
+                genres = [genre_map.get(gid, "") for gid in movie.get("genre_ids", []) if gid in genre_map]
+                title  = movie.get("title") or movie.get("original_title", "")
+                batch.append({
+                    "movie_id":       mid,
+                    "title":          title,
+                    "title_lower":    title.lower(),
+                    "overview":       movie.get("overview", ""),
+                    "overview_lower": movie.get("overview", "").lower(),
+                    "genres":         genres,
+                    "cast_members":   [],
+                    "cast_search":    "",
+                    "keywords":       [],
+                    "poster_path":    movie.get("poster_path"),
+                    "backdrop_path":  movie.get("backdrop_path"),
+                    "release_year":   (movie.get("release_date") or "")[:4],
+                    "vote_average":   float(movie.get("vote_average", 0)),
+                    "vote_count":     int(movie.get("vote_count", 0)),
+                    "popularity":     float(movie.get("popularity", 0)),
+                    "runtime":        None,
+                    "updated_at":     datetime.utcnow(),
+                })
             if len(batch) >= 500:
                 _write_pg_batch(batch)
                 batch = []
