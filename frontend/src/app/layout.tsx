@@ -5,13 +5,15 @@ import { Toaster } from "react-hot-toast";
 import { Navbar } from "@/components/Navbar";
 import { AppProvider } from "@/components/AppProvider";
 
+export const dynamic = "force-dynamic";
+
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 
 export const metadata: Metadata = {
   title: "CineCloud — AI-Powered Movie Recommendations",
   description:
-    "Cloud-native movie recommendation engine powered by AWS Lambda, DynamoDB, SQS, and hybrid collaborative + content-based filtering.",
-  keywords: ["movies", "recommendations", "cloud computing", "AWS", "serverless"],
+    "Cloud-native movie recommendation engine powered by Firebase, Firestore, and hybrid collaborative + content-based filtering.",
+  keywords: ["movies", "recommendations", "cloud computing", "Firebase", "serverless"],
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

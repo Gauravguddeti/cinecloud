@@ -16,7 +16,7 @@ import { useEffect, useRef } from "react";
 import { doc, onSnapshot, Unsubscribe } from "firebase/firestore";
 import toast from "react-hot-toast";
 import { db } from "@/lib/firebase";
-import useStore from "@/lib/store";
+import { useStore } from "@/lib/store";
 
 export function useRealtimeRecs(userId: string | null | undefined) {
   const setRecommendations = useStore((s) => s.setRecommendations);

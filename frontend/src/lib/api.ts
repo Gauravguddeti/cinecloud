@@ -101,6 +101,3 @@ export const eventsApi = {
 
 export default api;
 
-
-export default api;
-
