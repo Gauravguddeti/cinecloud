@@ -38,11 +38,16 @@ CLERK_JWKS_URL     = os.environ.get("CLERK_JWKS_URL", "")
 REDIS_URL          = os.environ.get("REDIS_URL", "")
 TMDB_API_KEY       = os.environ.get("TMDB_API_KEY", "")
 TOP_N              = 20
-CF_WEIGHT          = 0.70
-CBF_WEIGHT         = 0.30
+CF_WEIGHT          = 0.60
+CBF_WEIGHT         = 0.40
 MIN_RATINGS_FOR_CF = 3
 CACHE_TTL_REDIS    = 1800   # 30 min
 CACHE_TTL_DB       = 86400  # 24 h
+# Quality gates for recommendations
+MIN_VOTE_COUNT     = 50     # ignore movies with fewer votes than this
+MIN_VOTE_AVG       = 6.0    # ignore movies rated below this average
+MIN_CBF_SCORE      = 0.05   # minimum cosine similarity to enter candidate pool
+MAX_PER_FRANCHISE  = 3      # diversity cap: max results from same franchise/series
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -1179,6 +1184,96 @@ def _recompute_recs(user_id):
         print(f"[worker] Error for {user_id}: {e}")
 
 
+# =============================================================
+#  FRANCHISE / UNIVERSE DETECTION
+# =============================================================
+
+# Each tuple: (feature_key, list_of_lowercase_markers).
+# Markers are tested against a movie's titleLower + keywords + castSearch joined together.
+# Order matters — first match sets the primary franchise.
+FRANCHISE_SIGNALS = [
+    ("franchise:mcu",          ["marvel cinematic universe", "avengers", "iron man",
+                                 "captain america", "thor odinson", "black widow",
+                                 "spider-man", "guardians of the galaxy", "black panther",
+                                 "doctor strange", "ant-man", "thanos"]),
+    ("franchise:dc",           ["dc comics", "dc extended universe", "justice league",
+                                 "batman", "superman", "wonder woman", "aquaman",
+                                 "suicide squad", "gotham city"]),
+    ("franchise:star_wars",    ["star wars", "jedi", "sith", "the force",
+                                 "galactic empire", "darth vader", "lightsaber"]),
+    ("franchise:fast_furious", ["fast & furious", "fast and furious", "dominic toretto"]),
+    ("franchise:john_wick",    ["john wick", "the continental hotel"]),
+    ("franchise:mi",           ["mission: impossible", "ethan hunt"]),
+    ("franchise:james_bond",   ["james bond", "007 spy", "eon productions"]),
+    ("franchise:harry_potter", ["harry potter", "hogwarts", "wizarding world",
+                                 "voldemort", "fantastic beasts"]),
+    ("franchise:lotr",         ["lord of the rings", "middle-earth", "the hobbit",
+                                 "frodo baggins", "gandalf", "mordor"]),
+    ("franchise:jurassic",     ["jurassic park", "jurassic world"]),
+    ("franchise:x_men",        ["x-men", "charles xavier", "magneto", "wolverine"]),
+    ("franchise:transformers", ["transformers", "autobots", "decepticons", "optimus prime"]),
+    ("franchise:pirates",      ["pirates of the caribbean", "jack sparrow"]),
+    ("franchise:indiana_jones",["indiana jones"]),
+    ("franchise:monsterverse", ["monsterverse", "mechagodzilla", "godzilla vs"]),
+    ("franchise:alien",        ["alien franchise", "xenomorph"]),
+    ("franchise:toy_story",    ["toy story", "woody cowboy", "buzz lightyear"]),
+    ("franchise:rocky_creed",  ["rocky balboa", "creed boxing"]),
+    ("franchise:nolan",        ["christopher nolan"]),
+    ("franchise:aamir_khan",   ["aamir khan"]),
+    ("franchise:srk",          ["shah rukh khan"]),
+    ("franchise:salman_khan",  ["salman khan"]),
+    ("franchise:tarantino",    ["quentin tarantino"]),
+]
+
+_FRANCHISE_LABELS = {
+    "franchise:mcu":          "Marvel Universe",
+    "franchise:dc":           "DC Universe",
+    "franchise:star_wars":    "Star Wars Universe",
+    "franchise:fast_furious": "Fast & Furious series",
+    "franchise:john_wick":    "John Wick Universe",
+    "franchise:mi":           "Mission: Impossible series",
+    "franchise:james_bond":   "James Bond series",
+    "franchise:harry_potter": "Wizarding World",
+    "franchise:lotr":         "Middle-earth series",
+    "franchise:jurassic":     "Jurassic series",
+    "franchise:x_men":        "X-Men Universe",
+    "franchise:transformers": "Transformers series",
+    "franchise:pirates":      "Pirates of the Caribbean",
+    "franchise:indiana_jones":"Indiana Jones series",
+    "franchise:monsterverse": "Monsterverse",
+    "franchise:alien":        "Alien Universe",
+    "franchise:toy_story":    "Toy Story series",
+    "franchise:rocky_creed":  "Rocky / Creed series",
+}
+
+
+def _detect_franchise(movie):
+    """Return list of franchise feature-keys this movie belongs to."""
+    text = " ".join(filter(None, [
+        movie.get("titleLower") or "",
+        " ".join(movie.get("keywords") or []).lower(),
+        (movie.get("castSearch") or "").lower(),
+    ]))
+    return [fkey for fkey, markers in FRANCHISE_SIGNALS if any(m in text for m in markers)]
+
+
+def _quality_score(movie):
+    """0.0–1.0 quality signal: sigmoid on voteAverage (centred 7.0) + log-scaled voteCount."""
+    avg   = float(movie.get("voteAverage") or 0)
+    count = int(movie.get("voteCount") or 0)
+    avg_score   = 1.0 / (1.0 + math.exp(-1.5 * (avg - 7.0)))
+    count_score = math.log1p(min(count, 50_000)) / math.log1p(50_000)
+    return round(0.6 * avg_score + 0.4 * count_score, 4)
+
+
+def _passes_quality_gate(movie):
+    """Hard filter: exclude movies that are too obscure or poorly rated."""
+    return (
+        float(movie.get("voteAverage") or 0) >= MIN_VOTE_AVG
+        and int(movie.get("voteCount") or 0) >= MIN_VOTE_COUNT
+    )
+
+
 def _cosine_similarity(vec_a, vec_b):
     common = set(vec_a) & set(vec_b)
     if not common:
@@ -1214,14 +1309,21 @@ def _collaborative_filter(user_id, all_ratings, top_k=15):
 
 def _movie_feature_vector(movie):
     tf = defaultdict(float)
+    # Franchise / universe membership — highest weight (5.0).
+    # Ensures MCU fan sees MCU movies, Star Wars fan sees Star Wars, etc.
+    for fkey in _detect_franchise(movie):
+        tf[fkey] += 5.0
+    # Genre — strong signal (3.0)
     for g in (movie.get("genres") or []):
         if not g:
             continue
         tf[f"genre:{g.lower().replace(' ', '_')}"] += 3.0
+    # Lead cast — medium signal (2.0)
     for a in (movie.get("cast") or [])[:5]:
-        tf[f"cast:{a.lower().replace(' ', '_')}"]  += 2.0
+        tf[f"cast:{a.lower().replace(' ', '_')}"] += 2.0
+    # Keywords — context signal (1.0)
     for kw in (movie.get("keywords") or [])[:15]:
-        tf[f"kw:{kw.lower().replace(' ', '_')}"]   += 1.0
+        tf[f"kw:{kw.lower().replace(' ', '_')}"] += 1.0
     return dict(tf)
 
 
@@ -1248,8 +1350,12 @@ def _content_based_filter(user_id, all_ratings, movies_metadata):
     for mid, movie in movies_metadata.items():
         if mid in user_ratings:
             continue
+        # Hard quality gate: don't score junk movies at all
+        if not _passes_quality_gate(movie):
+            continue
         s = _cosine_similarity(pref, _movie_feature_vector(movie))
-        if s > 0:
+        # Minimum similarity threshold — sharing one genre barely qualifies; must be meaningfully similar
+        if s >= MIN_CBF_SCORE:
             scores[mid] = s
     return scores
 
@@ -1264,52 +1370,116 @@ def _normalise(scores):
     return {k: (v - lo) / spread for k, v in scores.items()}
 
 
+def _quality_popular(movies_metadata, exclude_ids: set, top_n: int, reason: str):
+    """Return top_n quality movies sorted by voteAverage × log(voteCount), excluding rated/already-listed."""
+    pool = [
+        m for m in movies_metadata.values()
+        if m["movieId"] not in exclude_ids and _passes_quality_gate(m)
+    ]
+    pool.sort(
+        key=lambda m: float(m.get("voteAverage", 0)) * math.log1p(int(m.get("voteCount") or 0)),
+        reverse=True,
+    )
+    return _fmt_recs(pool[:top_n], reason)
+
+
 def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N):
     user_ratings = all_ratings.get(user_id, {})
     if not user_ratings:
-        popular = sorted(movies_metadata.values(),
-                         key=lambda m: float(m.get("popularity", 0)), reverse=True)
-        return _fmt_recs(popular[:top_n], "Popular on CineCloud")
+        return _quality_popular(movies_metadata, set(), top_n, "Popular on CineCloud")
 
+    # ── Step 1: Build franchise affinity from highly-rated movies ─────────────
+    # Accumulate franchise weight from movies rated ≥ 4 stars
+    user_franchises: dict = defaultdict(float)
+    for mid, rating in user_ratings.items():
+        movie = movies_metadata.get(mid)
+        if not movie or rating < 4:
+            continue
+        for fkey in _detect_franchise(movie):
+            user_franchises[fkey] += (rating - 3.0)  # 1 for 4★, 2 for 5★
+
+    # ── Step 2: Run collaborative + content-based filters ─────────────────────
     cf_norm  = _normalise(_collaborative_filter(user_id, all_ratings))
     cbf_norm = _normalise(_content_based_filter(user_id, all_ratings, movies_metadata))
     candidates = set(cf_norm) | set(cbf_norm)
 
     if not candidates:
-        popular = sorted(movies_metadata.values(),
-                         key=lambda m: float(m.get("popularity", 0)), reverse=True)
-        return _fmt_recs([m for m in popular if m["movieId"] not in user_ratings][:top_n], "Trending")
+        return _quality_popular(movies_metadata, set(user_ratings), top_n, "Trending Now")
 
-    hybrid = sorted([
-        (
-            cf_norm.get(mid, 0) * CF_WEIGHT + cbf_norm.get(mid, 0) * CBF_WEIGHT,
-            mid,
-            "Because users like you enjoyed similar movies"
-            if cf_norm.get(mid, 0) > cbf_norm.get(mid, 0)
-            else "Because you enjoyed similar genres & cast",
-        )
-        for mid in candidates
-    ], reverse=True)
-
-    results = []
-    for score, mid, reason in hybrid[:top_n]:
+    # ── Step 3: Score every candidate with multi-signal blend ─────────────────
+    scored = []
+    for mid in candidates:
         movie = movies_metadata.get(mid)
-        if movie:
-            results.append({
-                "movieId":     mid,
-                "title":       movie.get("title", ""),
-                "posterPath":  movie.get("posterPath"),
-                "genres":      movie.get("genres", []),
-                "voteAverage": float(movie.get("voteAverage", 0)),
-                "releaseYear": movie.get("releaseYear", ""),
-                "score":       round(score, 4),
-                "reason":      reason,
-            })
-    # Safety net: hybrid produced 0 valid results → fall back to popular
-    if not results:
-        popular = sorted(movies_metadata.values(),
-                         key=lambda m: float(m.get("popularity", 0)), reverse=True)
-        return _fmt_recs([m for m in popular if m["movieId"] not in user_ratings][:top_n], "Trending")
+        if not movie or not _passes_quality_gate(movie):
+            continue
+
+        relevance = cf_norm.get(mid, 0) * CF_WEIGHT + cbf_norm.get(mid, 0) * CBF_WEIGHT
+        quality   = _quality_score(movie)
+
+        # Franchise affinity boost: how strongly does this movie match user's franchise love?
+        candidate_franchises = _detect_franchise(movie)
+        raw_boost   = sum(user_franchises.get(f, 0) for f in candidate_franchises)
+        franchise_norm = min(raw_boost / 5.0, 1.0)  # normalise, cap at 1.0
+
+        # Final blend: 60% relevance + 20% quality + 20% franchise affinity
+        final_score = relevance * 0.60 + quality * 0.20 + franchise_norm * 0.20
+
+        # ── Reason string ──────────────────────────────────────────────────────
+        if candidate_franchises and any(f in user_franchises for f in candidate_franchises):
+            matched_f = next(f for f in candidate_franchises if f in user_franchises)
+            label     = _FRANCHISE_LABELS.get(matched_f)
+            reason    = f"More from the {label}" if label else "More from a franchise you love"
+        elif cf_norm.get(mid, 0) > cbf_norm.get(mid, 0):
+            reason = "Fans of your rated movies loved this"
+        else:
+            top_genre = next(iter(movie.get("genres") or []), "")
+            reason = f"Because you enjoy {top_genre} films" if top_genre else "Matches your taste profile"
+
+        scored.append((final_score, mid, reason, candidate_franchises))
+
+    scored.sort(reverse=True)
+
+    # ── Step 4: Build result list with diversity enforcement ──────────────────
+    results = []
+    franchise_counts: dict = defaultdict(int)
+    seen_title_keys = set()
+
+    for final_score, mid, reason, candidate_franchises in scored[:top_n * 5]:
+        if len(results) >= top_n:
+            break
+        movie = movies_metadata.get(mid)
+        if not movie:
+            continue
+
+        # Deduplicate by normalised title prefix (avoids same movie under different IDs)
+        title_key = (movie.get("titleLower") or "")[:30]
+        if title_key in seen_title_keys:
+            continue
+
+        # Franchise diversity cap: no more than MAX_PER_FRANCHISE entries per series
+        if any(franchise_counts[f] >= MAX_PER_FRANCHISE for f in candidate_franchises):
+            continue
+
+        for f in candidate_franchises:
+            franchise_counts[f] += 1
+        seen_title_keys.add(title_key)
+
+        results.append({
+            "movieId":     mid,
+            "title":       movie.get("title", ""),
+            "posterPath":  movie.get("posterPath"),
+            "genres":      movie.get("genres", []),
+            "voteAverage": float(movie.get("voteAverage", 0)),
+            "releaseYear": movie.get("releaseYear", ""),
+            "score":       round(final_score, 4),
+            "reason":      reason,
+        })
+
+    # ── Step 5: Top-up with quality popular if algorithm produced too few ──────
+    if len(results) < top_n // 2:
+        exclude = set(user_ratings) | {r["movieId"] for r in results}
+        results.extend(_quality_popular(movies_metadata, exclude, top_n - len(results), "Trending Now"))
+
     return results
 
 
