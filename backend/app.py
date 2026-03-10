@@ -128,6 +128,9 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_movies_popularity ON movies(popularity DESC);
                 CREATE INDEX IF NOT EXISTS idx_movies_title_lower ON movies(title_lower);
             """)
+            # Fuzzy search — safe to run multiple times
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_movies_title_trgm ON movies USING gin(title_lower gin_trgm_ops);")
             conn.commit()
         print("[db] Tables ready")
     except Exception as e:
@@ -355,78 +358,77 @@ def movies_search():
     conn = _get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Fuzzy trigram + LIKE hybrid — tolerates typos (jumannjai → Jumanji)
             cur.execute("""
-                SELECT * FROM movies
-                WHERE title_lower    LIKE %s
-                   OR overview_lower LIKE %s
-                   OR cast_search    LIKE %s
-                ORDER BY popularity DESC
-                LIMIT 50
-            """, (f"%{q}%", f"%{q}%", f"%{q}%"))
+                SELECT *
+                FROM movies
+                WHERE word_similarity(%s, title_lower) > 0.2
+                   OR title_lower LIKE %s
+                   OR cast_search LIKE %s
+                ORDER BY
+                    CASE WHEN title_lower = %s    THEN 4
+                         WHEN title_lower LIKE %s THEN 3
+                         WHEN title_lower LIKE %s THEN 2
+                         ELSE 1 END DESC,
+                    word_similarity(%s, title_lower) DESC,
+                    popularity DESC
+                LIMIT 20
+            """, (
+                q, f"%{q}%", f"%{q}%",   # WHERE
+                q, f"{q}%", f"%{q}%",    # ORDER CASE
+                q,                        # final similarity sort
+            ))
             movies = [_movie_resp(dict(r)) for r in cur.fetchall()]
 
-        # If fewer than 5 results, fall back to live TMDB search and ingest new movies
-        if len(movies) < 5 and TMDB_API_KEY:
-            tmdb_resp = requests.get(
-                "https://api.themoviedb.org/3/search/movie",
-                params={"api_key": TMDB_API_KEY, "query": q, "language": "en-US", "page": 1},
-                timeout=10,
-            )
-            if tmdb_resp.ok:
-                existing_ids = {m["movieId"] for m in movies}
-                batch = []
-                for item in tmdb_resp.json().get("results", [])[:20]:
-                    mid = str(item["id"])
-                    if mid in existing_ids:
-                        continue
-                    detail = requests.get(
-                        f"https://api.themoviedb.org/3/movie/{mid}",
-                        params={"api_key": TMDB_API_KEY, "append_to_response": "credits,keywords"},
-                        timeout=10,
-                    )
-                    if not detail.ok:
-                        continue
-                    d = detail.json()
-                    genres = [g["name"] for g in d.get("genres", [])]
-                    cast   = [c["name"] for c in d.get("credits", {}).get("cast", [])[:10]]
-                    kws    = [k["name"] for k in d.get("keywords", {}).get("keywords", [])[:20]]
-                    batch.append({
-                        "movie_id":       mid,
-                        "title":          d.get("title", ""),
-                        "title_lower":    d.get("title", "").lower(),
-                        "overview":       d.get("overview", ""),
-                        "overview_lower": d.get("overview", "").lower(),
-                        "genres":         genres,
-                        "cast_members":   cast,
-                        "cast_search":    " ".join(cast).lower(),
-                        "keywords":       kws,
-                        "poster_path":    d.get("poster_path"),
-                        "backdrop_path":  d.get("backdrop_path"),
-                        "release_year":   (d.get("release_date") or "")[:4],
-                        "vote_average":   float(d.get("vote_average", 0)),
-                        "vote_count":     int(d.get("vote_count", 0)),
-                        "popularity":     float(d.get("popularity", 0)),
-                        "runtime":        d.get("runtime"),
-                        "updated_at":     datetime.utcnow(),
-                    })
-                if batch:
-                    _write_pg_batch(batch)
-                    # Re-query so freshly ingested results are included
-                    conn2 = _get_conn()
-                    try:
-                        with conn2.cursor(cursor_factory=RealDictCursor) as cur2:
-                            cur2.execute("""
-                                SELECT * FROM movies
-                                WHERE title_lower LIKE %s OR cast_search LIKE %s
-                                ORDER BY popularity DESC LIMIT 50
-                            """, (f"%{q}%", f"%{q}%"))
-                            movies = [_movie_resp(dict(r)) for r in cur2.fetchall()]
-                    finally:
-                        _put_conn(conn2)
+        # If sparse results, fire background TMDB import — returns instantly, next search will find them
+        if len(movies) < 4 and TMDB_API_KEY:
+            threading.Thread(target=_background_tmdb_import, args=(q,), daemon=True).start()
 
         return jsonify({"movies": movies, "count": len(movies)})
     finally:
         _put_conn(conn)
+
+
+def _background_tmdb_import(query: str):
+    """Fetch from TMDB for a search query and upsert into DB without blocking the response."""
+    genre_map = _fetch_genre_map()
+    try:
+        for lang in ("en-US", "hi-IN"):
+            resp = requests.get(
+                "https://api.themoviedb.org/3/search/movie",
+                params={"api_key": TMDB_API_KEY, "query": query, "language": lang, "page": 1},
+                timeout=10,
+            )
+            if not resp.ok:
+                continue
+            batch = []
+            for item in resp.json().get("results", [])[:10]:
+                mid   = str(item["id"])
+                title = item.get("title") or item.get("original_title", "")
+                genres = [genre_map.get(gid, "") for gid in item.get("genre_ids", []) if gid in genre_map]
+                batch.append({
+                    "movie_id":       mid,
+                    "title":          title,
+                    "title_lower":    title.lower(),
+                    "overview":       item.get("overview", ""),
+                    "overview_lower": item.get("overview", "").lower(),
+                    "genres":         genres,
+                    "cast_members":   [],
+                    "cast_search":    "",
+                    "keywords":       [],
+                    "poster_path":    item.get("poster_path"),
+                    "backdrop_path":  item.get("backdrop_path"),
+                    "release_year":   (item.get("release_date") or "")[:4],
+                    "vote_average":   float(item.get("vote_average", 0)),
+                    "vote_count":     int(item.get("vote_count", 0)),
+                    "popularity":     float(item.get("popularity", 0)),
+                    "runtime":        None,
+                    "updated_at":     datetime.utcnow(),
+                })
+            if batch:
+                _write_pg_batch(batch)
+    except Exception as e:
+        print(f"[bg_import] {e}")
 
 
 @app.route("/movies/popular", methods=["GET"])

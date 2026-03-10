@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useState, useRef, useCallback } from "react";
 import { useStore } from "@/lib/store";
 import { useRouter, usePathname } from "next/navigation";
 import { moviesApi } from "@/lib/api";
@@ -18,17 +18,27 @@ export function Navbar() {
   const [searchResults, setSearchResults] = useState<Movie[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const { setSelectedMovie } = useStore();
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
-  const handleSearch = async (q: string) => {
+  const handleSearch = useCallback((q: string) => {
     setSearchQuery(q);
-    if (q.length < 2) { setSearchResults([]); return; }
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (q.length < 1) { setSearchResults([]); setIsSearching(false); return; }
     setIsSearching(true);
-    try {
-      const { data } = await moviesApi.search(q);
-      setSearchResults(data.movies.slice(0, 6));
-    } catch {}
-    setIsSearching(false);
-  };
+    debounceRef.current = setTimeout(async () => {
+      if (abortRef.current) abortRef.current.abort();
+      abortRef.current = new AbortController();
+      try {
+        const { data } = await moviesApi.search(q);
+        setSearchResults(data.movies.slice(0, 7));
+      } catch (err: any) {
+        if (err?.code !== "ERR_CANCELED") setSearchResults([]);
+      } finally {
+        setIsSearching(false);
+      }
+    }, 250);
+  }, []);
 
   const handleLogout = () => {
     signOut(() => router.push("/"));
@@ -58,10 +68,28 @@ export function Navbar() {
             placeholder="Search movies..."
             value={searchQuery}
             onChange={(e) => handleSearch(e.target.value)}
-            className="w-full bg-white/10 border border-white/20 rounded-full px-4 py-1.5 text-sm placeholder-gray-400 focus:outline-none focus:border-brand-red transition-colors"
+            onKeyDown={(e) => e.key === "Escape" && (setSearchResults([]), setSearchQuery(""))}
+            className="w-full bg-white/10 border border-white/20 rounded-full px-4 py-1.5 pr-8 text-sm placeholder-gray-400 focus:outline-none focus:border-brand-red transition-colors"
           />
-          {searchResults.length > 0 && (
-            <div className="absolute top-full mt-2 w-full bg-brand-card border border-brand-border rounded-lg overflow-hidden shadow-2xl z-50">
+          {/* spinner / clear button */}
+          <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none">
+            {isSearching ? (
+              <svg className="animate-spin h-3.5 w-3.5 text-gray-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+              </svg>
+            ) : searchQuery ? (
+              <button
+                className="pointer-events-auto text-gray-500 hover:text-white"
+                onClick={() => { setSearchResults([]); setSearchQuery(""); }}
+              >✕</button>
+            ) : null}
+          </div>
+          {(searchResults.length > 0 || (isSearching && searchQuery)) && (
+            <div className="absolute top-full mt-2 w-72 bg-brand-card border border-brand-border rounded-lg overflow-hidden shadow-2xl z-50">
+              {isSearching && searchResults.length === 0 && (
+                <div className="px-4 py-3 text-sm text-gray-400">Searching...</div>
+              )}
               {searchResults.map((movie) => (
                 <button
                   key={movie.movieId}
