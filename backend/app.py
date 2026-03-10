@@ -120,6 +120,19 @@ def auth_register():
     try:
         user = firebase_auth.create_user(email=email, password=password, display_name=name)
     except firebase_auth.EmailAlreadyExistsError:
+        # Auth user exists but Firestore doc may be missing (e.g. created before Firestore was enabled)
+        try:
+            existing = firebase_auth.get_user_by_email(email)
+            doc = _db.collection("users").document(existing.uid).get()
+            if not doc.exists:
+                _db.collection("users").document(existing.uid).set({
+                    "userId": existing.uid, "email": email,
+                    "name": existing.display_name or name,
+                    "createdAt": datetime.utcnow().isoformat(),
+                })
+            return jsonify({"message": "User created", "userId": existing.uid}), 201
+        except Exception:
+            pass
         return jsonify({"error": "Email already registered"}), 409
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -168,7 +181,19 @@ def auth_profile():
         return _unauth()
     doc = _db.collection("users").document(uid).get()
     if not doc.exists:
-        return jsonify({"error": "User not found"}), 404
+        # Auto-create Firestore profile from Firebase Auth record
+        try:
+            fb_user = firebase_auth.get_user(uid)
+            profile = {
+                "userId": uid,
+                "email": fb_user.email or "",
+                "name": fb_user.display_name or "",
+                "createdAt": datetime.utcnow().isoformat(),
+            }
+            _db.collection("users").document(uid).set(profile)
+            return jsonify({"user": profile})
+        except Exception:
+            return jsonify({"error": "User not found"}), 404
     return jsonify({"user": doc.to_dict()})
 
 
