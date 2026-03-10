@@ -627,6 +627,8 @@ def admin_ingest_status():
 def _run_ingest(pages: int):
     global _ingest_status
     _ingest_status = {"running": True, "total": 0, "message": "fetching genre map..."}
+    # Use a dedicated fresh connection — avoids stale pool connections in background threads
+    conn = psycopg2.connect(DATABASE_URL)
     try:
         genre_map = _fetch_genre_map()
         SOURCES = [
@@ -675,21 +677,57 @@ def _run_ingest(pages: int):
                         "updated_at":     datetime.utcnow(),
                     })
                 if len(batch) >= 500:
-                    _write_pg_batch(batch)
+                    _flush_batch(conn, batch)
                     batch = []
             _ingest_status["message"] = f"processed {source['endpoint']} ({source['language']})"
         if batch:
-            _write_pg_batch(batch)
-        conn = _get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM movies")
-                total = cur.fetchone()[0]
-        finally:
-            _put_conn(conn)
+            _flush_batch(conn, batch)
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM movies")
+            total = cur.fetchone()[0]
         _ingest_status = {"running": False, "total": total, "message": f"Done — {total} movies in DB"}
     except Exception as e:
         _ingest_status = {"running": False, "total": 0, "message": f"Error: {e}"}
+        print(f"[ingest] {e}")
+    finally:
+        conn.close()
+
+
+def _flush_batch(conn, movies):
+    """Write a batch using an already-open connection (used by _run_ingest)."""
+    try:
+        with conn.cursor() as cur:
+            for m in movies:
+                cur.execute("""
+                    INSERT INTO movies (
+                        movie_id, title, title_lower, overview, overview_lower,
+                        genres, cast_members, cast_search, keywords,
+                        poster_path, backdrop_path, release_year,
+                        vote_average, vote_count, popularity, runtime, updated_at
+                    ) VALUES (
+                        %(movie_id)s, %(title)s, %(title_lower)s, %(overview)s, %(overview_lower)s,
+                        %(genres)s, %(cast_members)s, %(cast_search)s, %(keywords)s,
+                        %(poster_path)s, %(backdrop_path)s, %(release_year)s,
+                        %(vote_average)s, %(vote_count)s, %(popularity)s, %(runtime)s, %(updated_at)s
+                    )
+                    ON CONFLICT (movie_id) DO UPDATE SET
+                        title          = EXCLUDED.title,
+                        title_lower    = EXCLUDED.title_lower,
+                        overview       = EXCLUDED.overview,
+                        overview_lower = EXCLUDED.overview_lower,
+                        genres         = EXCLUDED.genres,
+                        poster_path    = EXCLUDED.poster_path,
+                        backdrop_path  = EXCLUDED.backdrop_path,
+                        release_year   = EXCLUDED.release_year,
+                        vote_average   = EXCLUDED.vote_average,
+                        vote_count     = EXCLUDED.vote_count,
+                        popularity     = EXCLUDED.popularity,
+                        updated_at     = EXCLUDED.updated_at
+                """, m)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[ingest] flush error: {e}")
 
 
 def _write_pg_batch(movies):
