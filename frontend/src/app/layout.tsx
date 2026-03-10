@@ -19,7 +19,12 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <ClerkProvider>
+    <ClerkProvider
+      signInUrl="/login"
+      signUpUrl="/register"
+      afterSignInUrl="/"
+      afterSignUpUrl="/"
+    >
       <html lang="en" className="dark">
         <body className={`${inter.variable} font-sans bg-brand-dark text-white min-h-screen`}>
           <AppProvider>
