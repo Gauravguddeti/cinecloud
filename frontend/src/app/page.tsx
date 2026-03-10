@@ -131,11 +131,11 @@ export default function HomePage() {
             <div className="text-5xl mb-4">☁️</div>
             <h2 className="text-3xl font-black mb-2">Cloud-Native Recommendation Engine</h2>
             <p className="text-gray-400 max-w-xl mx-auto text-sm mb-8">
-              Built on AWS Lambda · DynamoDB · SQS · Cognito · CloudFront.
+              Built on Firebase · Firestore · Render · Upstash Redis.
               Hybrid Collaborative + Content-Based Filtering, delivered in milliseconds via Upstash Redis.
             </p>
             <div className="flex flex-wrap justify-center gap-3 mb-8">
-              {["Serverless", "Event-Driven", "Auto-Scaling", "WebSockets", "IaC", "CDN"].map((tag) => (
+              {["Serverless", "Event-Driven", "Auto-Scaling", "Real-Time", "IaC", "CDN"].map((tag) => (
                 <span key={tag} className="text-xs bg-brand-red/20 text-red-400 border border-brand-red/30 px-3 py-1.5 rounded-full">
                   {tag}
                 </span>

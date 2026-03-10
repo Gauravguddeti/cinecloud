@@ -94,15 +94,15 @@ export default function ProfilePage() {
         <div className="grid md:grid-cols-3 gap-4 text-sm">
           <div className="bg-black/30 rounded-xl p-4">
             <p className="font-semibold text-brand-red mb-1">① You Rate a Movie</p>
-            <p className="text-gray-400">Your rating is written to DynamoDB and a message is published to AWS SQS.</p>
+            <p className="text-gray-400">Your rating is written to Firestore and queued for async processing.</p>
           </div>
           <div className="bg-black/30 rounded-xl p-4">
             <p className="font-semibold text-yellow-400 mb-1">② Lambda Worker Triggers</p>
-            <p className="text-gray-400">SQS triggers the recommendation worker Lambda, which runs the hybrid CF+CBF algorithm.</p>
+            <p className="text-gray-400">A background worker runs the hybrid CF+CBF algorithm on your ratings.</p>
           </div>
           <div className="bg-black/30 rounded-xl p-4">
             <p className="font-semibold text-green-400 mb-1">③ Real-Time Push</p>
-            <p className="text-gray-400">New recommendations are cached in Redis and pushed to you via WebSocket — instantly.</p>
+            <p className="text-gray-400">New recommendations are cached in Redis and pushed via Firestore real-time — instantly.</p>
           </div>
         </div>
       </section>
