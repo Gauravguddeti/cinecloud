@@ -1,18 +1,12 @@
 import { create } from "zustand";
 import type { User, Recommendation, Rating, Movie } from "@/lib/types";
-import { authApi, ratingsApi, recommendationsApi } from "@/lib/api";
-import { signInWithEmailAndPassword, signOut } from "firebase/auth";
-import { firebaseAuth } from "@/lib/firebase";
+import { ratingsApi, recommendationsApi } from "@/lib/api";
 
 interface AppState {
-  // Auth
+  // Auth (managed by AppProvider via Clerk — set after /auth/sync)
   user: User | null;
-  accessToken: string | null;
   isAuthenticated: boolean;
-  login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string, name: string) => Promise<void>;
-  logout: () => void;
-  loadUser: () => Promise<void>;
+  setUser: (user: User | null) => void;
 
   // Ratings
   ratings: Record<string, number>;         // movieId → star rating
@@ -34,43 +28,9 @@ interface AppState {
 export const useStore = create<AppState>((set, get) => ({
   // ── Auth ─────────────────────────────────────────────────
   user: null,
-  accessToken: null,
   isAuthenticated: false,
 
-  login: async (email, password) => {
-    // Sign in via Firebase SDK — handles token issuance, refresh, etc.
-    const credential = await signInWithEmailAndPassword(firebaseAuth, email, password);
-    const idToken = await credential.user.getIdToken();
-    localStorage.setItem("accessToken", idToken);
-    const { data } = await authApi.getProfile();
-    set({ user: data.user, accessToken: idToken, isAuthenticated: true });
-    await Promise.all([get().loadRatings(), get().loadRecommendations()]);
-  },
-
-  register: async (email, password, name) => {
-    await authApi.register(email, password, name);
-    // Auto-login after register
-    await get().login(email, password);
-  },
-
-  logout: () => {
-    signOut(firebaseAuth).catch(() => {});
-    localStorage.removeItem("accessToken");
-    set({ user: null, accessToken: null, isAuthenticated: false, ratings: {}, recommendations: [] });
-  },
-
-  loadUser: async () => {
-    const fbUser = firebaseAuth.currentUser;
-    if (!fbUser) return;
-    try {
-      const idToken = await fbUser.getIdToken();
-      localStorage.setItem("accessToken", idToken);
-      const { data } = await authApi.getProfile();
-      set({ user: data.user, accessToken: idToken, isAuthenticated: true });
-    } catch {
-      get().logout();
-    }
-  },
+  setUser: (user) => set({ user, isAuthenticated: !!user }),
 
   // ── Ratings ───────────────────────────────────────────────
   ratings: {},
@@ -80,7 +40,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!user) return;
     await ratingsApi.submit(movieId, rating);
     set((state) => ({ ratings: { ...state.ratings, [movieId]: rating } }));
-    // Recommendations are updated automatically via Firestore onSnapshot in useRealtimeRecs
+    // Recommendations are refreshed via polling in useRealtimeRecs
   },
 
   loadRatings: async () => {

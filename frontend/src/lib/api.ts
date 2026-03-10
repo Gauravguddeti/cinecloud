@@ -6,7 +6,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
 const api = axios.create({ baseURL: API_URL });
 
-// Attach Firebase ID token on every request
+// Attach Clerk JWT (stored by AppProvider) on every request
 api.interceptors.request.use((config) => {
   if (typeof window !== "undefined") {
     const token = localStorage.getItem("accessToken");
@@ -15,25 +15,14 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// On 401: ask Firebase SDK for a fresh token and retry once
+// On 401: clear stale token and redirect to sign-in
 api.interceptors.response.use(
   (res) => res,
-  async (error) => {
-    const original = error.config;
-    if (error.response?.status === 401 && !original._retry) {
-      original._retry = true;
-      try {
-        const { firebaseAuth } = await import("@/lib/firebase");
-        const user = firebaseAuth.currentUser;
-        if (user) {
-          const freshToken = await user.getIdToken(true);
-          localStorage.setItem("accessToken", freshToken);
-          original.headers.Authorization = `Bearer ${freshToken}`;
-          return api(original);
-        }
-      } catch {
+  (error) => {
+    if (error.response?.status === 401) {
+      if (typeof window !== "undefined") {
         localStorage.removeItem("accessToken");
-        if (typeof window !== "undefined") window.location.href = "/login";
+        window.location.href = "/sign-in";
       }
     }
     return Promise.reject(error);
@@ -42,11 +31,9 @@ api.interceptors.response.use(
 
 // ── Auth ──────────────────────────────────────────────────────
 export const authApi = {
-  register: (email: string, password: string, name: string) =>
-    api.post<{ message: string; userId: string }>("/auth/register", { email, password, name }),
-
-  login: (email: string, password: string) =>
-    api.post<LoginResponse>("/auth/login", { email, password }),
+  /** Called after Clerk sign-in to upsert the user row in NeonDB */
+  sync: (email: string, name: string) =>
+    api.post<{ user: import("./types").User }>("/auth/sync", { email, name }),
 
   getProfile: () => api.get<{ user: import("./types").User }>("/auth/profile"),
 };

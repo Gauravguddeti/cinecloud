@@ -7,9 +7,11 @@ import { useRouter, usePathname } from "next/navigation";
 import { moviesApi } from "@/lib/api";
 import type { Movie } from "@/lib/types";
 import clsx from "clsx";
+import { useClerk } from "@clerk/nextjs";
 
 export function Navbar() {
-  const { isAuthenticated, user, logout } = useStore();
+  const { isAuthenticated, user } = useStore();
+  const { signOut } = useClerk();
   const router = useRouter();
   const pathname = usePathname();
   const [searchQuery, setSearchQuery] = useState("");
@@ -29,8 +31,7 @@ export function Navbar() {
   };
 
   const handleLogout = () => {
-    logout();
-    router.push("/");
+    signOut(() => router.push("/"));
   };
 
   return (
@@ -123,3 +124,4 @@ function NavLink({ href, active, children }: { href: string; active: boolean; ch
     </Link>
   );
 }
+

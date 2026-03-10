@@ -1,15 +1,13 @@
 """
-CineCloud — Unified Flask Backend for Render.com
-=================================================
-Replaces: 7 GCP Cloud Functions (no billing required!)
-Uses:     Firebase Auth + Firestore + Upstash Redis
-Deploy:   render.com free tier (see render.yaml)
-
-Keep-alive: self-pings /ping every 13 min so Render free tier never sleeps
-Real-time:  Background thread writes updated recs to Firestore
-            → frontend Firestore onSnapshot fires automatically ⚡
+CineCloud — Flask Backend (Clerk + NeonDB edition)
+==================================================
+Auth:     Clerk (JWT RS256 via JWKS)
+Database: NeonDB (PostgreSQL via psycopg2)
+Cache:    Upstash Redis (30 min) + recommendations table (24 h fallback)
+Deploy:   Render.com free tier
 """
 
+import base64
 import json
 import math
 import os
@@ -18,9 +16,13 @@ import time
 from collections import defaultdict
 from datetime import datetime
 
-import firebase_admin
+import psycopg2
+from psycopg2 import pool as pg_pool
+from psycopg2.extras import RealDictCursor
+import jwt as pyjwt
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+from cryptography.hazmat.backends import default_backend
 import requests
-from firebase_admin import credentials, auth as firebase_auth, firestore
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
@@ -30,37 +32,113 @@ try:
 except ImportError:
     _redis_available = False
 
-# ── Firebase Admin init ───────────────────────────────────────
-# On Render: set FIREBASE_SERVICE_ACCOUNT_JSON env var (JSON string)
-# Locally:   uses Application Default Credentials (gcloud auth)
-if not firebase_admin._apps:
-    _sa_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
-    if _sa_json:
-        cred = credentials.Certificate(json.loads(_sa_json))
-        firebase_admin.initialize_app(cred)
-    else:
-        firebase_admin.initialize_app()
-
-_db = firestore.client()
-
 # ── Config ────────────────────────────────────────────────────
-REDIS_URL            = os.environ.get("REDIS_URL", "")
-FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "")
-TMDB_API_KEY         = os.environ.get("TMDB_API_KEY", "")
-TOP_N                = 20
-CF_WEIGHT            = 0.70
-CBF_WEIGHT           = 0.30
-MIN_RATINGS_FOR_CF   = 3
-CACHE_TTL_REDIS      = 1800    # 30 min
-CACHE_TTL_FIRESTORE  = 86400   # 24 h
+DATABASE_URL       = os.environ.get("DATABASE_URL", "")
+CLERK_JWKS_URL     = os.environ.get("CLERK_JWKS_URL", "")
+REDIS_URL          = os.environ.get("REDIS_URL", "")
+TMDB_API_KEY       = os.environ.get("TMDB_API_KEY", "")
+TOP_N              = 20
+CF_WEIGHT          = 0.70
+CBF_WEIGHT         = 0.30
+MIN_RATINGS_FOR_CF = 3
+CACHE_TTL_REDIS    = 1800   # 30 min
+CACHE_TTL_DB       = 86400  # 24 h
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 
+# ── PostgreSQL connection pool ────────────────────────────────
+_db_pool = None
+
+
+def _get_db_pool():
+    global _db_pool
+    if _db_pool is None and DATABASE_URL:
+        _db_pool = pg_pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
+    return _db_pool
+
+
+def _get_conn():
+    pool = _get_db_pool()
+    if pool is None:
+        raise RuntimeError("DATABASE_URL not configured")
+    return pool.getconn()
+
+
+def _put_conn(conn):
+    pool = _get_db_pool()
+    if pool:
+        pool.putconn(conn)
+
+
+# ── Init DB tables on startup ─────────────────────────────────
+def init_db():
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id    TEXT PRIMARY KEY,
+                    email      TEXT UNIQUE NOT NULL,
+                    name       TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS movies (
+                    movie_id       TEXT PRIMARY KEY,
+                    title          TEXT,
+                    title_lower    TEXT,
+                    overview       TEXT,
+                    overview_lower TEXT,
+                    genres         TEXT[],
+                    cast_members   TEXT[],
+                    cast_search    TEXT,
+                    keywords       TEXT[],
+                    poster_path    TEXT,
+                    backdrop_path  TEXT,
+                    release_year   TEXT,
+                    vote_average   FLOAT DEFAULT 0,
+                    vote_count     INT   DEFAULT 0,
+                    popularity     FLOAT DEFAULT 0,
+                    runtime        INT,
+                    updated_at     TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS ratings (
+                    id         SERIAL PRIMARY KEY,
+                    user_id    TEXT REFERENCES users(user_id),
+                    movie_id   TEXT,
+                    rating     FLOAT,
+                    rated_at   TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, movie_id)
+                );
+                CREATE TABLE IF NOT EXISTS recommendations (
+                    user_id     TEXT PRIMARY KEY,
+                    recs        JSONB DEFAULT '[]',
+                    computed_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS events (
+                    id         SERIAL PRIMARY KEY,
+                    user_id    TEXT,
+                    event_type TEXT,
+                    properties JSONB DEFAULT '{}',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_ratings_user_id ON ratings(user_id);
+                CREATE INDEX IF NOT EXISTS idx_movies_popularity ON movies(popularity DESC);
+                CREATE INDEX IF NOT EXISTS idx_movies_title_lower ON movies(title_lower);
+            """)
+            conn.commit()
+        print("[db] Tables ready")
+    except Exception as e:
+        conn.rollback()
+        print(f"[db] Init error: {e}")
+    finally:
+        _put_conn(conn)
+
+
 # ── Keep-alive thread (prevents Render free tier sleep) ───────
 def _keep_alive_loop():
-    """Self-ping every 14 min as backup. QStash is the primary keep-alive (every 5 min)."""
     self_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     if not self_url:
         print("[keep-alive] RENDER_EXTERNAL_URL not set — skipping")
@@ -70,9 +148,10 @@ def _keep_alive_loop():
         time.sleep(14 * 60)
         try:
             requests.get(f"{self_url}/ping", timeout=10)
-            print(f"[keep-alive] Pinged self at {datetime.utcnow().isoformat()}")
+            print(f"[keep-alive] Pinged at {datetime.utcnow().isoformat()}")
         except Exception as e:
             print(f"[keep-alive] Ping failed: {e}")
+
 
 threading.Thread(target=_keep_alive_loop, daemon=True).start()
 
@@ -90,14 +169,72 @@ def _get_redis():
         return None
 
 
-# ── Auth helper ───────────────────────────────────────────────
+# ── Clerk JWT verification ────────────────────────────────────
+_jwks_cache = {"keys": {}, "fetched_at": 0}
+_JWKS_TTL   = 3600  # reload JWKS every hour
+
+
+def _get_jwks():
+    now = time.time()
+    if _jwks_cache["keys"] and now - _jwks_cache["fetched_at"] < _JWKS_TTL:
+        return _jwks_cache["keys"]
+    if not CLERK_JWKS_URL:
+        return {}
+    try:
+        resp = requests.get(CLERK_JWKS_URL, timeout=10)
+        if resp.ok:
+            keys = {k["kid"]: k for k in resp.json().get("keys", []) if "kid" in k}
+            _jwks_cache["keys"] = keys
+            _jwks_cache["fetched_at"] = now
+            return keys
+    except Exception as e:
+        print(f"[jwks] Fetch failed: {e}")
+    return _jwks_cache["keys"]  # return stale on error
+
+
+def _b64url_to_int(s):
+    pad = 4 - len(s) % 4
+    if pad != 4:
+        s += "=" * pad
+    return int.from_bytes(base64.urlsafe_b64decode(s), "big")
+
+
+def _jwk_to_public_key(jwk):
+    n = _b64url_to_int(jwk["n"])
+    e = _b64url_to_int(jwk["e"])
+    return RSAPublicNumbers(e, n).public_key(default_backend())
+
+
 def _verify_token():
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
         return None
+    token = header[7:]
     try:
-        return firebase_auth.verify_id_token(header.split("Bearer ")[1])["uid"]
-    except Exception:
+        unverified = pyjwt.get_unverified_header(token)
+        kid        = unverified.get("kid")
+        keys       = _get_jwks()
+        if not keys:
+            # No JWKS available — decode unverified (dev/fallback only)
+            payload = pyjwt.decode(token, options={"verify_signature": False})
+            return payload.get("sub")
+        jwk = keys.get(kid)
+        if not jwk:
+            # kid not cached — force refresh once
+            _jwks_cache["fetched_at"] = 0
+            keys = _get_jwks()
+            jwk  = keys.get(kid)
+        if not jwk:
+            return None
+        public_key = _jwk_to_public_key(jwk)
+        payload    = pyjwt.decode(
+            token, public_key,
+            algorithms=["RS256"],
+            options={"verify_aud": False},
+        )
+        return payload.get("sub")
+    except Exception as e:
+        print(f"[auth] verify error: {e}")
         return None
 
 
@@ -105,73 +242,47 @@ def _unauth():
     return jsonify({"error": "Unauthorized"}), 401
 
 
+# ── Start up ──────────────────────────────────────────────────
+try:
+    init_db()
+except Exception as _e:
+    print(f"[startup] DB init skipped: {_e}")
+
+
 # =============================================================
 #  AUTH
 # =============================================================
 
-@app.route("/auth/register", methods=["POST"])
-def auth_register():
-    body = request.get_json() or {}
-    email    = body.get("email", "").strip()
-    password = body.get("password", "")
-    name     = body.get("name", "").strip()
-    if not email or not password or not name:
-        return jsonify({"error": "email, password and name required"}), 400
-    try:
-        user = firebase_auth.create_user(email=email, password=password, display_name=name)
-    except firebase_auth.EmailAlreadyExistsError:
-        # Auth user exists but Firestore doc may be missing (e.g. created before Firestore was enabled)
-        try:
-            existing = firebase_auth.get_user_by_email(email)
-            doc = _db.collection("users").document(existing.uid).get()
-            if not doc.exists:
-                _db.collection("users").document(existing.uid).set({
-                    "userId": existing.uid, "email": email,
-                    "name": existing.display_name or name,
-                    "createdAt": datetime.utcnow().isoformat(),
-                })
-            return jsonify({"message": "User created", "userId": existing.uid}), 201
-        except Exception:
-            pass
-        return jsonify({"error": "Email already registered"}), 409
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-    _db.collection("users").document(user.uid).set({
-        "userId": user.uid, "email": email, "name": name,
-        "createdAt": datetime.utcnow().isoformat(),
-    })
-    return jsonify({"message": "User created", "userId": user.uid}), 201
-
-
-@app.route("/auth/login", methods=["POST"])
-def auth_login():
+@app.route("/auth/sync", methods=["POST"])
+def auth_sync():
+    """Called by frontend after Clerk sign-in to upsert user in NeonDB."""
+    uid = _verify_token()
+    if not uid:
+        return _unauth()
     body  = request.get_json() or {}
-    email = body.get("email", "")
-    pw    = body.get("password", "")
-    if not FIREBASE_WEB_API_KEY:
-        return jsonify({"error": "Server misconfigured"}), 500
-
-    resp = requests.post(
-        f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
-        f"?key={FIREBASE_WEB_API_KEY}",
-        json={"email": email, "password": pw, "returnSecureToken": True},
-        timeout=10,
-    )
-    data = resp.json()
-    if not resp.ok:
-        msg = data.get("error", {}).get("message", "Login failed")
-        return jsonify({"error": msg}), 401
-
-    uid     = data["localId"]
-    profile = _db.collection("users").document(uid).get()
-    user    = profile.to_dict() if profile.exists else {"userId": uid, "email": email, "name": ""}
-    return jsonify({
-        "accessToken":  data["idToken"],
-        "idToken":      data["idToken"],
-        "refreshToken": data["refreshToken"],
-        "user":         user,
-    })
+    email = body.get("email", "").strip()
+    name  = body.get("name", "").strip()
+    if not email:
+        return jsonify({"error": "email required"}), 400
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                INSERT INTO users (user_id, email, name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE
+                    SET email = EXCLUDED.email,
+                        name  = COALESCE(NULLIF(EXCLUDED.name, ''), users.name)
+                RETURNING *
+            """, (uid, email, name))
+            user = dict(cur.fetchone())
+            conn.commit()
+        return jsonify({"user": _user_resp(user)})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        _put_conn(conn)
 
 
 @app.route("/auth/profile", methods=["GET"])
@@ -179,22 +290,26 @@ def auth_profile():
     uid = _verify_token()
     if not uid:
         return _unauth()
-    doc = _db.collection("users").document(uid).get()
-    if not doc.exists:
-        # Auto-create Firestore profile from Firebase Auth record
-        try:
-            fb_user = firebase_auth.get_user(uid)
-            profile = {
-                "userId": uid,
-                "email": fb_user.email or "",
-                "name": fb_user.display_name or "",
-                "createdAt": datetime.utcnow().isoformat(),
-            }
-            _db.collection("users").document(uid).set(profile)
-            return jsonify({"user": profile})
-        except Exception:
-            return jsonify({"error": "User not found"}), 404
-    return jsonify({"user": doc.to_dict()})
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM users WHERE user_id = %s", (uid,))
+            row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "User not found — call /auth/sync first"}), 404
+        return jsonify({"user": _user_resp(dict(row))})
+    finally:
+        _put_conn(conn)
+
+
+def _user_resp(row):
+    created = row.get("created_at")
+    return {
+        "userId":    row["user_id"],
+        "email":     row["email"],
+        "name":      row.get("name", ""),
+        "createdAt": created.isoformat() if hasattr(created, "isoformat") else str(created or ""),
+    }
 
 
 # =============================================================
@@ -205,12 +320,20 @@ def auth_profile():
 def movies_list():
     genre = request.args.get("genre")
     limit = min(int(request.args.get("limit", 50)), 200)
-    query = _db.collection("movies")
-    if genre:
-        query = query.where(filter=firestore.FieldFilter("genres", "array_contains", genre))
-    docs   = query.limit(limit).stream()
-    movies = [d.to_dict() for d in docs]
-    return jsonify({"movies": movies, "count": len(movies)})
+    conn  = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if genre:
+                cur.execute(
+                    "SELECT * FROM movies WHERE %s = ANY(genres) ORDER BY popularity DESC LIMIT %s",
+                    (genre, limit),
+                )
+            else:
+                cur.execute("SELECT * FROM movies ORDER BY popularity DESC LIMIT %s", (limit,))
+            movies = [_movie_resp(dict(r)) for r in cur.fetchall()]
+        return jsonify({"movies": movies, "count": len(movies)})
+    finally:
+        _put_conn(conn)
 
 
 @app.route("/movies/search", methods=["GET"])
@@ -218,43 +341,80 @@ def movies_search():
     q = request.args.get("q", "").lower().strip()
     if not q:
         return jsonify({"movies": [], "count": 0})
-    docs    = _db.collection("movies").limit(300).stream()
-    results = [
-        d.to_dict() for d in docs
-        if q in d.to_dict().get("titleLower", "")
-        or q in d.to_dict().get("overviewLower", "")
-        or q in d.to_dict().get("castSearch", "")
-    ]
-    return jsonify({"movies": results, "count": len(results)})
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM movies
+                WHERE title_lower    LIKE %s
+                   OR overview_lower LIKE %s
+                   OR cast_search    LIKE %s
+                ORDER BY popularity DESC
+                LIMIT 50
+            """, (f"%{q}%", f"%{q}%", f"%{q}%"))
+            movies = [_movie_resp(dict(r)) for r in cur.fetchall()]
+        return jsonify({"movies": movies, "count": len(movies)})
+    finally:
+        _put_conn(conn)
 
 
 @app.route("/movies/popular", methods=["GET"])
 def movies_popular():
     limit = min(int(request.args.get("limit", 20)), 100)
-    docs  = (
-        _db.collection("movies")
-           .order_by("popularity", direction=firestore.Query.DESCENDING)
-           .limit(limit)
-           .stream()
-    )
-    movies = [d.to_dict() for d in docs]
-    return jsonify({"movies": movies, "count": len(movies)})
+    conn  = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM movies ORDER BY popularity DESC LIMIT %s", (limit,))
+            movies = [_movie_resp(dict(r)) for r in cur.fetchall()]
+        return jsonify({"movies": movies, "count": len(movies)})
+    finally:
+        _put_conn(conn)
 
 
 @app.route("/movies/genres", methods=["GET"])
 def movies_genres():
-    genres = set()
-    for d in _db.collection("movies").limit(500).stream():
-        genres.update(d.to_dict().get("genres", []))
-    return jsonify({"genres": sorted(genres)})
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT unnest(genres) AS g FROM movies ORDER BY g")
+            genres = [r[0] for r in cur.fetchall()]
+        return jsonify({"genres": genres})
+    finally:
+        _put_conn(conn)
 
 
 @app.route("/movies/detail/<movie_id>", methods=["GET"])
 def movies_detail(movie_id):
-    doc = _db.collection("movies").document(movie_id).get()
-    if not doc.exists:
-        return jsonify({"error": "Movie not found"}), 404
-    return jsonify({"movie": doc.to_dict()})
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM movies WHERE movie_id = %s", (movie_id,))
+            row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "Movie not found"}), 404
+        return jsonify({"movie": _movie_resp(dict(row))})
+    finally:
+        _put_conn(conn)
+
+
+def _movie_resp(row):
+    return {
+        "movieId":      row["movie_id"],
+        "title":        row.get("title", ""),
+        "titleLower":   row.get("title_lower", ""),
+        "overview":     row.get("overview", ""),
+        "genres":       row.get("genres") or [],
+        "cast":         row.get("cast_members") or [],
+        "castSearch":   row.get("cast_search", ""),
+        "keywords":     row.get("keywords") or [],
+        "posterPath":   row.get("poster_path"),
+        "backdropPath": row.get("backdrop_path"),
+        "releaseYear":  row.get("release_year", ""),
+        "voteAverage":  float(row.get("vote_average") or 0),
+        "voteCount":    int(row.get("vote_count") or 0),
+        "popularity":   float(row.get("popularity") or 0),
+        "runtime":      row.get("runtime"),
+    }
 
 
 # =============================================================
@@ -274,17 +434,24 @@ def ratings_submit():
     rating = float(rating)
     if not 1 <= rating <= 5:
         return jsonify({"error": "Rating must be 1-5"}), 400
-
-    now  = datetime.utcnow().isoformat()
-    data = {"userId": uid, "movieId": movie_id, "rating": rating,
-            "ratedAt": now, "updatedAt": now}
-    _db.collection("ratings").document(f"{uid}_{movie_id}").set(data)
-    _db.collection("movies").document(movie_id).set(
-        {"totalRatings": firestore.Increment(1)}, merge=True
-    )
-
-    # Async recompute — replaces Pub/Sub worker ⚡
+    now  = datetime.utcnow()
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO ratings (user_id, movie_id, rating, rated_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, movie_id) DO UPDATE
+                    SET rating = EXCLUDED.rating, updated_at = EXCLUDED.updated_at
+            """, (uid, movie_id, rating, now, now))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        _put_conn(conn)
     threading.Thread(target=_recompute_recs, args=(uid,), daemon=True).start()
+    data = {"userId": uid, "movieId": movie_id, "rating": rating, "ratedAt": now.isoformat()}
     return jsonify({"message": "Rating submitted", "rating": data})
 
 
@@ -293,13 +460,21 @@ def ratings_get_user(user_id):
     uid = _verify_token()
     if not uid or uid != user_id:
         return _unauth()
-    docs = (
-        _db.collection("ratings")
-           .where(filter=firestore.FieldFilter("userId", "==", user_id))
-           .stream()
-    )
-    ratings = [d.to_dict() for d in docs]
-    return jsonify({"ratings": ratings, "count": len(ratings)})
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM ratings WHERE user_id = %s ORDER BY updated_at DESC", (user_id,)
+            )
+            ratings = [{
+                "userId":  r["user_id"],
+                "movieId": r["movie_id"],
+                "rating":  float(r["rating"]),
+                "ratedAt": r["rated_at"].isoformat() if hasattr(r.get("rated_at"), "isoformat") else str(r.get("rated_at", "")),
+            } for r in cur.fetchall()]
+        return jsonify({"ratings": ratings, "count": len(ratings)})
+    finally:
+        _put_conn(conn)
 
 
 # =============================================================
@@ -315,15 +490,14 @@ def recommendations_get(user_id):
     if cached:
         return jsonify({"recommendations": cached, "userId": user_id,
                         "fromCache": True, "count": len(cached)})
-    t0             = time.time()
-    all_ratings    = _load_all_ratings()
+    t0              = time.time()
+    all_ratings     = _load_all_ratings()
     movies_metadata = _load_movies_metadata()
-    recs           = compute_recommendations(user_id, all_ratings, movies_metadata)
-    elapsed        = round(time.time() - t0, 3)
+    recs            = compute_recommendations(user_id, all_ratings, movies_metadata)
+    elapsed         = round(time.time() - t0, 3)
     _cache_set(user_id, recs)
     return jsonify({"recommendations": recs, "userId": user_id,
-                    "fromCache": False, "computeTimeSeconds": elapsed,
-                    "count": len(recs)})
+                    "fromCache": False, "computeTimeSeconds": elapsed, "count": len(recs)})
 
 
 @app.route("/recommendations/<user_id>/refresh", methods=["POST"])
@@ -352,7 +526,6 @@ def admin_ingest():
         return jsonify({"error": "TMDB_API_KEY not set"}), 500
 
     batch = []
-    total = 0
     for page in range(1, pages + 1):
         resp = requests.get(
             "https://api.themoviedb.org/3/movie/popular",
@@ -369,46 +542,87 @@ def admin_ingest():
             )
             if not detail.ok:
                 continue
-            d       = detail.json()
-            genres  = [g["name"] for g in d.get("genres", [])]
-            cast    = [c["name"] for c in d.get("credits", {}).get("cast", [])[:10]]
-            kws     = [k["name"] for k in d.get("keywords", {}).get("keywords", [])[:20]]
+            d      = detail.json()
+            genres = [g["name"] for g in d.get("genres", [])]
+            cast   = [c["name"] for c in d.get("credits", {}).get("cast", [])[:10]]
+            kws    = [k["name"] for k in d.get("keywords", {}).get("keywords", [])[:20]]
             batch.append({
-                "movieId":       str(d["id"]),
-                "title":         d.get("title", ""),
-                "titleLower":    d.get("title", "").lower(),
-                "overview":      d.get("overview", ""),
-                "overviewLower": d.get("overview", "").lower(),
-                "genres":        genres,
-                "cast":          cast,
-                "castSearch":    " ".join(cast).lower(),
-                "keywords":      kws,
-                "posterPath":    d.get("poster_path"),
-                "backdropPath":  d.get("backdrop_path"),
-                "releaseYear":   (d.get("release_date") or "")[:4],
-                "voteAverage":   float(d.get("vote_average", 0)),
-                "voteCount":     int(d.get("vote_count", 0)),
-                "popularity":    float(d.get("popularity", 0)),
-                "runtime":       d.get("runtime"),
-                "updatedAt":     datetime.utcnow().isoformat(),
+                "movie_id":       str(d["id"]),
+                "title":          d.get("title", ""),
+                "title_lower":    d.get("title", "").lower(),
+                "overview":       d.get("overview", ""),
+                "overview_lower": d.get("overview", "").lower(),
+                "genres":         genres,
+                "cast_members":   cast,
+                "cast_search":    " ".join(cast).lower(),
+                "keywords":       kws,
+                "poster_path":    d.get("poster_path"),
+                "backdrop_path":  d.get("backdrop_path"),
+                "release_year":   (d.get("release_date") or "")[:4],
+                "vote_average":   float(d.get("vote_average", 0)),
+                "vote_count":     int(d.get("vote_count", 0)),
+                "popularity":     float(d.get("popularity", 0)),
+                "runtime":        d.get("runtime"),
+                "updated_at":     datetime.utcnow(),
             })
-            if len(batch) == 500:
-                _write_firestore_batch(batch)
-                total += len(batch)
+            if len(batch) >= 500:
+                _write_pg_batch(batch)
                 batch = []
 
     if batch:
-        _write_firestore_batch(batch)
-        total += len(batch)
-    return jsonify({"message": f"Ingested {total} movies", "total": total})
+        _write_pg_batch(batch)
+
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM movies")
+            total = cur.fetchone()[0]
+    finally:
+        _put_conn(conn)
+    return jsonify({"message": f"Total movies in DB: {total}", "total": total})
 
 
-def _write_firestore_batch(movies):
-    wb = _db.batch()
-    for m in movies:
-        ref = _db.collection("movies").document(m["movieId"])
-        wb.set(ref, m, merge=True)
-    wb.commit()
+def _write_pg_batch(movies):
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            for m in movies:
+                cur.execute("""
+                    INSERT INTO movies (
+                        movie_id, title, title_lower, overview, overview_lower,
+                        genres, cast_members, cast_search, keywords,
+                        poster_path, backdrop_path, release_year,
+                        vote_average, vote_count, popularity, runtime, updated_at
+                    ) VALUES (
+                        %(movie_id)s, %(title)s, %(title_lower)s, %(overview)s, %(overview_lower)s,
+                        %(genres)s, %(cast_members)s, %(cast_search)s, %(keywords)s,
+                        %(poster_path)s, %(backdrop_path)s, %(release_year)s,
+                        %(vote_average)s, %(vote_count)s, %(popularity)s, %(runtime)s, %(updated_at)s
+                    )
+                    ON CONFLICT (movie_id) DO UPDATE SET
+                        title          = EXCLUDED.title,
+                        title_lower    = EXCLUDED.title_lower,
+                        overview       = EXCLUDED.overview,
+                        overview_lower = EXCLUDED.overview_lower,
+                        genres         = EXCLUDED.genres,
+                        cast_members   = EXCLUDED.cast_members,
+                        cast_search    = EXCLUDED.cast_search,
+                        keywords       = EXCLUDED.keywords,
+                        poster_path    = EXCLUDED.poster_path,
+                        backdrop_path  = EXCLUDED.backdrop_path,
+                        release_year   = EXCLUDED.release_year,
+                        vote_average   = EXCLUDED.vote_average,
+                        vote_count     = EXCLUDED.vote_count,
+                        popularity     = EXCLUDED.popularity,
+                        runtime        = EXCLUDED.runtime,
+                        updated_at     = EXCLUDED.updated_at
+                """, m)
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[ingest] batch write failed: {e}")
+    finally:
+        _put_conn(conn)
 
 
 # =============================================================
@@ -421,12 +635,19 @@ def events_track():
     if not uid:
         return _unauth()
     body = request.get_json() or {}
-    _db.collection("events").add({
-        "userId":     uid,
-        "eventType":  body.get("eventType", ""),
-        "properties": body.get("properties", {}),
-        "timestamp":  datetime.utcnow().isoformat(),
-    })
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO events (user_id, event_type, properties) VALUES (%s, %s, %s)",
+                (uid, body.get("eventType", ""), json.dumps(body.get("properties", {}))),
+            )
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[events] track error: {e}")
+    finally:
+        _put_conn(conn)
     return jsonify({"tracked": True})
 
 
@@ -437,12 +658,11 @@ def ping():
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"service": "CineCloud API", "status": "running",
-                    "version": "2.0-render"})
+    return jsonify({"service": "CineCloud API", "status": "running", "version": "3.0-clerk-neon"})
 
 
 # =============================================================
-#  CACHE HELPERS
+#  CACHE HELPERS  (Redis primary, recommendations table fallback)
 # =============================================================
 
 def _cache_get(user_id):
@@ -454,14 +674,22 @@ def _cache_get(user_id):
                 return json.loads(cached)
         except Exception:
             pass
+    # DB fallback — use if less than 24 h old
+    conn = _get_conn()
     try:
-        doc = _db.collection("recommendations").document(user_id).get()
-        if doc.exists:
-            data = doc.to_dict()
-            if int(data.get("ttl", 0)) > int(time.time()):
-                return data.get("recommendations", [])
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT recs, computed_at FROM recommendations WHERE user_id = %s", (user_id,)
+            )
+            row = cur.fetchone()
+        if row:
+            age = (datetime.utcnow() - row["computed_at"]).total_seconds()
+            if age < CACHE_TTL_DB:
+                return row["recs"]
     except Exception:
         pass
+    finally:
+        _put_conn(conn)
     return None
 
 
@@ -472,15 +700,21 @@ def _cache_set(user_id, recs):
             r.setex(f"rec:{user_id}", CACHE_TTL_REDIS, json.dumps(recs))
         except Exception:
             pass
+    conn = _get_conn()
     try:
-        _db.collection("recommendations").document(user_id).set({
-            "userId":          user_id,
-            "recommendations": recs,
-            "computedAt":      datetime.utcnow().isoformat(),
-            "ttl":             int(time.time()) + CACHE_TTL_FIRESTORE,
-        })
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO recommendations (user_id, recs, computed_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                    SET recs = EXCLUDED.recs, computed_at = EXCLUDED.computed_at
+            """, (user_id, json.dumps(recs)))
+            conn.commit()
     except Exception as e:
-        print(f"[cache] Firestore write failed: {e}")
+        conn.rollback()
+        print(f"[cache] DB write failed: {e}")
+    finally:
+        _put_conn(conn)
 
 
 def _cache_invalidate(user_id):
@@ -490,29 +724,45 @@ def _cache_invalidate(user_id):
             r.delete(f"rec:{user_id}")
         except Exception:
             pass
+    conn = _get_conn()
     try:
-        _db.collection("recommendations").document(user_id).delete()
-    except Exception:
-        pass
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM recommendations WHERE user_id = %s", (user_id,))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+    finally:
+        _put_conn(conn)
 
 
 # =============================================================
-#  DATA LOADERS (Firestore)
+#  DATA LOADERS (PostgreSQL)
 # =============================================================
 
 def _load_all_ratings():
     ratings = defaultdict(dict)
-    for doc in _db.collection("ratings").stream():
-        r = doc.to_dict()
-        ratings[r["userId"]][r["movieId"]] = float(r["rating"])
+    conn    = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id, movie_id, rating FROM ratings")
+            for user_id, movie_id, rating in cur.fetchall():
+                ratings[user_id][movie_id] = float(rating)
+    finally:
+        _put_conn(conn)
     return dict(ratings)
 
 
 def _load_movies_metadata():
     movies = {}
-    for doc in _db.collection("movies").stream():
-        data          = doc.to_dict()
-        movies[data["movieId"]] = data
+    conn   = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM movies")
+            for row in cur.fetchall():
+                m = _movie_resp(dict(row))
+                movies[m["movieId"]] = m
+    finally:
+        _put_conn(conn)
     return movies
 
 
@@ -521,12 +771,12 @@ def _load_movies_metadata():
 # =============================================================
 
 def _recompute_recs(user_id):
-    """Background thread worker — replaces GCP Pub/Sub consumer."""
+    """Background thread worker."""
     try:
         _cache_invalidate(user_id)
         recs = compute_recommendations(user_id, _load_all_ratings(), _load_movies_metadata())
         _cache_set(user_id, recs)
-        print(f"[worker] {len(recs)} recs for {user_id} written to Firestore")
+        print(f"[worker] {len(recs)} recs for {user_id} written to DB")
     except Exception as e:
         print(f"[worker] Error for {user_id}: {e}")
 
@@ -567,11 +817,11 @@ def _collaborative_filter(user_id, all_ratings, top_k=15):
 def _movie_feature_vector(movie):
     tf = defaultdict(float)
     for g  in movie.get("genres", []):
-        tf[f"genre:{g.lower().replace(' ','_')}"] += 3.0
-    for a in movie.get("cast", [])[:5]:
-        tf[f"cast:{a.lower().replace(' ','_')}"]  += 2.0
-    for kw in movie.get("keywords", [])[:15]:
-        tf[f"kw:{kw.lower().replace(' ','_')}"]   += 1.0
+        tf[f"genre:{g.lower().replace(' ', '_')}"] += 3.0
+    for a in (movie.get("cast") or [])[:5]:
+        tf[f"cast:{a.lower().replace(' ', '_')}"]  += 2.0
+    for kw in (movie.get("keywords") or [])[:15]:
+        tf[f"kw:{kw.lower().replace(' ', '_')}"]   += 1.0
     return dict(tf)
 
 
@@ -675,3 +925,4 @@ def _fmt_recs(movies, reason):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
