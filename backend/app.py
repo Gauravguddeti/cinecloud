@@ -355,6 +355,13 @@ def movies_search():
     q = request.args.get("q", "").lower().strip()
     if not q:
         return jsonify({"movies": [], "count": 0})
+
+    # In-memory cache — same query within 60 s returns instantly (prevents TMDB hammering on debounce)
+    now    = time.time()
+    cached = _search_cache.get(q)
+    if cached and (now - cached["ts"]) < 60:
+        return jsonify({"movies": cached["movies"], "count": len(cached["movies"])})
+
     conn = _get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -382,23 +389,31 @@ def movies_search():
     finally:
         _put_conn(conn)
 
-    # If sparse DB results, query TMDB synchronously so user sees real results NOW
-    if len(db_movies) < 4 and TMDB_API_KEY:
+    # Go to TMDB when there's no direct substring match in DB titles
+    # (fuzzy can return 4+ irrelevant results, e.g. "lagaan" matching unrelated films)
+    has_direct_match = any(q in m.get("titleLower", "") for m in db_movies)
+    if not has_direct_match and TMDB_API_KEY:
         tmdb_resp, raw_batch = _tmdb_live_search(q)
         db_ids = {m["movieId"] for m in db_movies}
         extra  = [m for m in tmdb_resp if m["movieId"] not in db_ids]
         movies = db_movies + extra
-        # Persist new movies to DB in background so future searches are instant
         if raw_batch:
             threading.Thread(target=_background_tmdb_import, args=(raw_batch,), daemon=True).start()
     else:
         movies = db_movies
 
-    return jsonify({"movies": movies[:20], "count": len(movies[:20])})
+    result = movies[:20]
+    _search_cache[q] = {"movies": result, "ts": now}
+    # Prune entries older than 5 min to prevent unbounded growth
+    stale = [k for k, v in list(_search_cache.items()) if (now - v["ts"]) > 300]
+    for k in stale:
+        _search_cache.pop(k, None)
+
+    return jsonify({"movies": result, "count": len(result)})
 
 
 def _tmdb_live_search(query: str):
-    """Search TMDB for query (en + hi) and return (response-shaped list, raw upsert batch)."""
+    """Search TMDB movies + TV for query (en + hi) and return (response-shaped list, raw upsert batch)."""
     genre_map = _fetch_genre_map()
     resp_movies, raw_batch, seen = [], [], set()
     for lang in ("en-US", "hi-IN"):
@@ -458,7 +473,70 @@ def _tmdb_live_search(query: str):
                 "popularity":   float(item.get("popularity", 0)),
                 "runtime":      None,
             })
+    # Also search TV series (handles "13 Reasons Why", "Stranger Things", "Breaking Bad", etc.)
+    _append_tv_results(query, genre_map, seen, resp_movies, raw_batch)
     return resp_movies, raw_batch
+
+
+def _append_tv_results(query: str, genre_map: dict, seen: set, resp_movies: list, raw_batch: list):
+    """Append TMDB TV series results into the shared lists (en + hi)."""
+    for lang in ("en-US", "hi-IN"):
+        try:
+            r = requests.get(
+                "https://api.themoviedb.org/3/search/tv",
+                params={"api_key": TMDB_API_KEY, "query": query, "language": lang, "page": 1},
+                timeout=8,
+            )
+        except Exception:
+            continue
+        if not r.ok:
+            continue
+        for item in r.json().get("results", [])[:5]:
+            mid = f"tv_{item['id']}"
+            if mid in seen:
+                continue
+            seen.add(mid)
+            title         = item.get("name") or item.get("original_name", "")
+            genres        = [genre_map.get(gid, "") for gid in item.get("genre_ids", []) if gid in genre_map]
+            poster_path   = item.get("poster_path")
+            backdrop_path = item.get("backdrop_path")
+            release_year  = (item.get("first_air_date") or "")[:4]
+            raw_batch.append({
+                "movie_id":       mid,
+                "title":          title,
+                "title_lower":    title.lower(),
+                "overview":       item.get("overview", ""),
+                "overview_lower": item.get("overview", "").lower(),
+                "genres":         genres,
+                "cast_members":   [],
+                "cast_search":    "",
+                "keywords":       [],
+                "poster_path":    poster_path,
+                "backdrop_path":  backdrop_path,
+                "release_year":   release_year,
+                "vote_average":   float(item.get("vote_average", 0)),
+                "vote_count":     int(item.get("vote_count", 0)),
+                "popularity":     float(item.get("popularity", 0)),
+                "runtime":        None,
+                "updated_at":     datetime.utcnow(),
+            })
+            resp_movies.append({
+                "movieId":      mid,
+                "title":        title,
+                "titleLower":   title.lower(),
+                "overview":     item.get("overview", ""),
+                "genres":       genres,
+                "cast":         [],
+                "castSearch":   "",
+                "keywords":     [],
+                "posterPath":   ("https://image.tmdb.org/t/p/w500" + poster_path) if poster_path else None,
+                "backdropPath": ("https://image.tmdb.org/t/p/w1280" + backdrop_path) if backdrop_path else None,
+                "releaseYear":  release_year,
+                "voteAverage":  float(item.get("vote_average", 0)),
+                "voteCount":    int(item.get("vote_count", 0)),
+                "popularity":   float(item.get("popularity", 0)),
+                "runtime":      None,
+            })
 
 
 def _background_tmdb_import(raw_batch: list):
@@ -676,6 +754,7 @@ def recommendations_refresh(user_id):
 #  ETL — TMDB INGEST
 # =============================================================
 
+_search_cache: dict = {}  # query → {"movies": list, "ts": float}; 60 s TTL, auto-pruned
 _ingest_status = {"running": False, "total": 0, "message": "idle"}
 
 def _fetch_genre_map():
@@ -1144,6 +1223,11 @@ def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N):
                 "score":       round(score, 4),
                 "reason":      reason,
             })
+    # Safety net: hybrid produced 0 valid results → fall back to popular
+    if not results:
+        popular = sorted(movies_metadata.values(),
+                         key=lambda m: float(m.get("popularity", 0)), reverse=True)
+        return _fmt_recs([m for m in popular if m["movieId"] not in user_ratings][:top_n], "Trending")
     return results
 
 

@@ -121,7 +121,7 @@ export default function HomePage() {
 
             {recsLoading ? (
               <SkeletonRow />
-            ) : hasRatings && recommendations.length > 0 ? (
+            ) : recommendations.length > 0 ? (
               <HorizontalScroll>
                 {recommendations.map((rec) => (
                   <MovieCard
@@ -132,6 +132,16 @@ export default function HomePage() {
                   />
                 ))}
               </HorizontalScroll>
+            ) : hasRatings ? (
+              <div className="border border-dashed border-brand-border rounded-xl p-8 text-center">
+                <p className="text-gray-400 text-sm">Your picks are being computed…</p>
+                <button
+                  onClick={loadRecommendations}
+                  className="inline-block mt-3 text-brand-red text-sm hover:underline"
+                >
+                  Refresh picks →
+                </button>
+              </div>
             ) : (
               <EmptyRecsPrompt />
             )}

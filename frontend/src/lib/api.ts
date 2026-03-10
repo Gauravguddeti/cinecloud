@@ -57,8 +57,8 @@ export const moviesApi = {
   get: (movieId: string) =>
     api.get<{ movie: Movie }>(`/movies/detail/${movieId}`),
 
-  search: (q: string) =>
-    api.get<{ movies: Movie[]; count: number }>("/movies/search", { params: { q } }),
+  search: (q: string, signal?: AbortSignal) =>
+    api.get<{ movies: Movie[]; count: number }>("/movies/search", { params: { q }, signal }),
 
   popular: (limit = 20) =>
     api.get<{ movies: Movie[]; count: number }>("/movies/popular", { params: { limit } }),

@@ -30,7 +30,7 @@ export function Navbar() {
       if (abortRef.current) abortRef.current.abort();
       abortRef.current = new AbortController();
       try {
-        const { data } = await moviesApi.search(q);
+        const { data } = await moviesApi.search(q, abortRef.current.signal);
         setSearchResults(data.movies.slice(0, 7));
       } catch (err: any) {
         if (err?.code !== "ERR_CANCELED") setSearchResults([]);
