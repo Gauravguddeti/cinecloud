@@ -1,0 +1,42 @@
+# Git ignore patterns for CineCloud
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Serverless Framework
+.serverless/
+.build/
+
+# Node / npm
+node_modules/
+.npm/
+
+# Environment secrets — NEVER commit these
+.env
+.env.local
+.env.production
+
+# Next.js
+frontend/.next/
+frontend/out/
+frontend/node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AWS SAM / CDK artifacts
+cdk.out/
+samconfig.toml

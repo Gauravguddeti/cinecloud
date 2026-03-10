@@ -1,0 +1,28 @@
+# render.yaml — Infrastructure as Code for Render.com
+# Deploy: push to GitHub, connect repo in render.com dashboard, it reads this file automatically.
+#
+# Free tier: 750 hrs/month web service + cron job included
+# Keep-alive: the Flask app self-pings /ping every 13 min (built into app.py)
+# Cron bot:   UptimeRobot (free) pings /ping every 5 min as extra insurance
+
+services:
+  - type: web
+    name: cinecloud-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --bind 0.0.0.0:$PORT --timeout 120
+    plan: free
+    healthCheckPath: /ping
+    autoDeploy: true
+    envVars:
+      - key: TMDB_API_KEY
+        sync: false          # Set manually in Render dashboard → Environment
+      - key: FIREBASE_WEB_API_KEY
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false          # Paste the full service account JSON as a single-line string
+      - key: PYTHON_VERSION
+        value: 3.11.0

@@ -1,0 +1,635 @@
+service: cinecloud
+
+frameworkVersion: "3"
+
+plugins:
+  - serverless-python-requirements
+  - serverless-offline
+
+custom:
+  stage: ${opt:stage, 'dev'}
+  region: us-east-1
+
+  # DynamoDB table names
+  usersTable: cinecloud-users-${self:custom.stage}
+  moviesTable: cinecloud-movies-${self:custom.stage}
+  ratingsTable: cinecloud-ratings-${self:custom.stage}
+  recommendationsTable: cinecloud-recommendations-${self:custom.stage}
+  connectionsTable: cinecloud-connections-${self:custom.stage}
+
+  # SQS queue name
+  ratingEventsQueue: cinecloud-rating-events-${self:custom.stage}
+
+  # S3 bucket for movie assets
+  assetsBucket: cinecloud-assets-${self:custom.stage}-${aws:accountId}
+
+  # Python requirements bundling
+  pythonRequirements:
+    dockerizePip: non-linux
+    zip: true
+    slim: true
+    layer: true
+
+  # Serverless Offline config
+  serverless-offline:
+    httpPort: 4000
+    websocketPort: 4001
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: ${self:custom.region}
+  stage: ${self:custom.stage}
+  memorySize: 256
+  timeout: 29
+
+  # Environment variables available to ALL Lambda functions
+  environment:
+    STAGE: ${self:custom.stage}
+    USERS_TABLE: ${self:custom.usersTable}
+    MOVIES_TABLE: ${self:custom.moviesTable}
+    RATINGS_TABLE: ${self:custom.ratingsTable}
+    RECOMMENDATIONS_TABLE: ${self:custom.recommendationsTable}
+    CONNECTIONS_TABLE: ${self:custom.connectionsTable}
+    RATING_EVENTS_QUEUE_URL: !Ref RatingEventsQueue
+    ASSETS_BUCKET: ${self:custom.assetsBucket}
+    COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+    COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
+    TMDB_API_KEY: ${env:TMDB_API_KEY}
+    REDIS_URL: ${env:REDIS_URL}
+    WEBSOCKET_API_ENDPOINT: !Sub "https://${WebsocketsApi}.execute-api.${aws:region}.amazonaws.com/${self:custom.stage}"
+
+  # IAM Role — Least Privilege principle
+  iam:
+    role:
+      statements:
+        # DynamoDB access
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:BatchWriteItem
+            - dynamodb:BatchGetItem
+          Resource:
+            - !GetAtt UsersTable.Arn
+            - !GetAtt MoviesTable.Arn
+            - !GetAtt RatingsTable.Arn
+            - !GetAtt RecommendationsTable.Arn
+            - !GetAtt ConnectionsTable.Arn
+            - !Sub "${UsersTable.Arn}/index/*"
+            - !Sub "${MoviesTable.Arn}/index/*"
+            - !Sub "${RatingsTable.Arn}/index/*"
+            - !Sub "${RecommendationsTable.Arn}/index/*"
+
+        # SQS access
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource: !GetAtt RatingEventsQueue.Arn
+
+        # SQS Dead Letter Queue
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Resource: !GetAtt RatingEventsDLQ.Arn
+
+        # S3 access
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:DeleteObject
+            - s3:ListBucket
+          Resource:
+            - !Sub "arn:aws:s3:::${self:custom.assetsBucket}"
+            - !Sub "arn:aws:s3:::${self:custom.assetsBucket}/*"
+
+        # Cognito access
+        - Effect: Allow
+          Action:
+            - cognito-idp:AdminGetUser
+            - cognito-idp:AdminCreateUser
+            - cognito-idp:AdminSetUserPassword
+            - cognito-idp:InitiateAuth
+            - cognito-idp:RespondToAuthChallenge
+            - cognito-idp:GetUser
+          Resource: !GetAtt CognitoUserPool.Arn
+
+        # API Gateway Management (for WebSocket push)
+        - Effect: Allow
+          Action:
+            - execute-api:ManageConnections
+          Resource:
+            - !Sub "arn:aws:execute-api:${aws:region}:${aws:accountId}:${WebsocketsApi}/*"
+
+# ─────────────────────────────────────────────
+#  LAMBDA FUNCTIONS
+# ─────────────────────────────────────────────
+functions:
+
+  # ── Auth Service ──────────────────────────
+  authService:
+    handler: functions/auth_service/handler.lambda_handler
+    description: "User registration, login, token refresh via AWS Cognito"
+    layers:
+      - !Ref PythonRequirementsLambdaLayer
+    events:
+      - http:
+          path: /auth/register
+          method: post
+          cors: true
+      - http:
+          path: /auth/login
+          method: post
+          cors: true
+      - http:
+          path: /auth/refresh
+          method: post
+          cors: true
+      - http:
+          path: /auth/profile
+          method: get
+          cors: true
+          authorizer:
+            name: cognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn: !GetAtt CognitoUserPool.Arn
+
+  # ── Movie Service ─────────────────────────
+  movieService:
+    handler: functions/movie_service/handler.lambda_handler
+    description: "Movie catalog: browse, search, detail, popular, genres"
+    memorySize: 512
+    layers:
+      - !Ref PythonRequirementsLambdaLayer
+    events:
+      - http:
+          path: /movies
+          method: get
+          cors: true
+      - http:
+          path: /movies/search
+          method: get
+          cors: true
+      - http:
+          path: /movies/popular
+          method: get
+          cors: true
+      - http:
+          path: /movies/genres
+          method: get
+          cors: true
+      - http:
+          path: /movies/{movieId}
+          method: get
+          cors: true
+
+  # ── ETL / Ingestion Pipeline ──────────────
+  ingestMovies:
+    handler: functions/etl_pipeline/handler.lambda_handler
+    description: "ETL: Fetch movies from TMDB API → populate DynamoDB (run once or on schedule)"
+    memorySize: 1024
+    timeout: 300
+    layers:
+      - !Ref PythonRequirementsLambdaLayer
+    events:
+      # Scheduled: runs every Sunday at 2 AM UTC to refresh catalog
+      - schedule:
+          rate: cron(0 2 ? * SUN *)
+          enabled: true
+          input:
+            pages: 20
+      # Also invocable manually via HTTP (admin only)
+      - http:
+          path: /admin/ingest
+          method: post
+          cors: true
+
+  # ── Rating Service ────────────────────────
+  ratingService:
+    handler: functions/rating_service/handler.lambda_handler
+    description: "Submit/update movie ratings; publishes SQS event for async recomputation"
+    layers:
+      - !Ref PythonRequirementsLambdaLayer
+    events:
+      - http:
+          path: /ratings
+          method: post
+          cors: true
+          authorizer:
+            name: cognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn: !GetAtt CognitoUserPool.Arn
+      - http:
+          path: /ratings/{userId}
+          method: get
+          cors: true
+          authorizer:
+            name: cognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn: !GetAtt CognitoUserPool.Arn
+
+  # ── Recommendation Service ────────────────
+  recommendationService:
+    handler: functions/recommendation_service/handler.lambda_handler
+    description: "Hybrid CF+CBF recommendations — checks Redis cache, computes on miss"
+    memorySize: 512
+    layers:
+      - !Ref PythonRequirementsLambdaLayer
+    events:
+      - http:
+          path: /recommendations/{userId}
+          method: get
+          cors: true
+          authorizer:
+            name: cognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn: !GetAtt CognitoUserPool.Arn
+      - http:
+          path: /recommendations/{userId}/refresh
+          method: post
+          cors: true
+          authorizer:
+            name: cognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn: !GetAtt CognitoUserPool.Arn
+
+  # ── Recommendation Worker (SQS Consumer) ──
+  recommendationWorker:
+    handler: functions/recommendation_service/worker.lambda_handler
+    description: "SQS consumer: recomputes recommendations asynchronously after a rating event"
+    memorySize: 1024
+    timeout: 120
+    layers:
+      - !Ref PythonRequirementsLambdaLayer
+    events:
+      - sqs:
+          arn: !GetAtt RatingEventsQueue.Arn
+          batchSize: 5
+          functionResponseType: ReportBatchItemFailures
+
+  # ── WebSocket: Connect ────────────────────
+  wsConnect:
+    handler: functions/event_tracker/handler.connect
+    description: "WebSocket $connect — stores connection ID in DynamoDB"
+    events:
+      - websocket:
+          route: $connect
+          authorizer:
+            name: wsAuthorizer
+            identitySource:
+              - "route.request.querystring.token"
+
+  # ── WebSocket: Disconnect ─────────────────
+  wsDisconnect:
+    handler: functions/event_tracker/handler.disconnect
+    description: "WebSocket $disconnect — removes connection ID from DynamoDB"
+    events:
+      - websocket:
+          route: $disconnect
+
+  # ── WebSocket: Default (event tracking) ───
+  wsDefault:
+    handler: functions/event_tracker/handler.default_message
+    description: "WebSocket $default — receives view/click events from frontend"
+    events:
+      - websocket:
+          route: $default
+
+  # ── WebSocket Authorizer ──────────────────
+  wsAuthorizer:
+    handler: functions/event_tracker/handler.ws_authorizer
+    description: "Validates JWT token for WebSocket connections"
+
+# ─────────────────────────────────────────────
+#  AWS RESOURCES (CloudFormation)
+# ─────────────────────────────────────────────
+resources:
+  Resources:
+
+    # ── DynamoDB Tables ──────────────────────
+    UsersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.usersTable}
+        BillingMode: PAY_PER_REQUEST       # serverless pricing
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: email
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: email-index
+            KeySchema:
+              - AttributeName: email
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        Tags:
+          - Key: Project
+            Value: CineCloud
+
+    MoviesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.moviesTable}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: movieId
+            AttributeType: S
+          - AttributeName: genre
+            AttributeType: S
+          - AttributeName: popularity
+            AttributeType: N
+        KeySchema:
+          - AttributeName: movieId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: genre-popularity-index
+            KeySchema:
+              - AttributeName: genre
+                KeyType: HASH
+              - AttributeName: popularity
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        Tags:
+          - Key: Project
+            Value: CineCloud
+
+    RatingsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.ratingsTable}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: movieId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: movieId
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: movie-ratings-index
+            KeySchema:
+              - AttributeName: movieId
+                KeyType: HASH
+              - AttributeName: userId
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        Tags:
+          - Key: Project
+            Value: CineCloud
+
+    RecommendationsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.recommendationsTable}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true             # auto-expire stale recommendations after 24h
+        Tags:
+          - Key: Project
+            Value: CineCloud
+
+    ConnectionsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.connectionsTable}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: connectionId
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: connectionId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: userId-index
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+        Tags:
+          - Key: Project
+            Value: CineCloud
+
+    # ── SQS Queues ───────────────────────────
+    RatingEventsDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: cinecloud-rating-events-dlq-${self:custom.stage}
+        MessageRetentionPeriod: 1209600   # 14 days
+
+    RatingEventsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.ratingEventsQueue}
+        VisibilityTimeout: 180            # must be >= Lambda timeout * 6
+        MessageRetentionPeriod: 86400     # 1 day
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt RatingEventsDLQ.Arn
+          maxReceiveCount: 3
+
+    # ── S3 Bucket ────────────────────────────
+    AssetsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.assetsBucket}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders: ["*"]
+              AllowedMethods: [GET]
+              AllowedOrigins: ["*"]
+              MaxAge: 3600
+        Tags:
+          - Key: Project
+            Value: CineCloud
+
+    # ── CloudFront Distribution ───────────────
+    CloudFrontDistribution:
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          Enabled: true
+          Comment: "CineCloud Assets CDN"
+          DefaultCacheBehavior:
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          Origins:
+            - Id: S3Origin
+              DomainName: !GetAtt AssetsBucket.RegionalDomainName
+              S3OriginConfig:
+                OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOAI}"
+        Tags:
+          - Key: Project
+            Value: CineCloud
+
+    CloudFrontOAI:
+      Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+      Properties:
+        CloudFrontOriginAccessIdentityConfig:
+          Comment: "CineCloud S3 OAI"
+
+    AssetsBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref AssetsBucket
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+              Action: s3:GetObject
+              Resource: !Sub "${AssetsBucket.Arn}/*"
+
+    # ── Cognito User Pool ─────────────────────
+    CognitoUserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: cinecloud-users-${self:custom.stage}
+        UsernameAttributes:
+          - email
+        AutoVerifiedAttributes:
+          - email
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireUppercase: true
+            RequireLowercase: true
+            RequireNumbers: true
+            RequireSymbols: false
+        Schema:
+          - Name: email
+            AttributeDataType: String
+            Mutable: true
+            Required: true
+          - Name: name
+            AttributeDataType: String
+            Mutable: true
+            Required: false
+        AccountRecovery:
+          RecoveryMechanisms:
+            - Name: verified_email
+              Priority: 1
+        UserPoolTags:
+          Project: CineCloud
+
+    CognitoUserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: cinecloud-app-client
+        UserPoolId: !Ref CognitoUserPool
+        GenerateSecret: false             # public client (SPA)
+        ExplicitAuthFlows:
+          - ALLOW_USER_PASSWORD_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+          - ALLOW_USER_SRP_AUTH
+        AccessTokenValidity: 1            # hours
+        RefreshTokenValidity: 30          # days
+        TokenValidityUnits:
+          AccessToken: hours
+          RefreshToken: days
+        PreventUserExistenceErrors: ENABLED
+
+    # ── CloudWatch Alarms ─────────────────────
+    RecommendationErrorAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: cinecloud-recommendation-errors-${self:custom.stage}
+        AlarmDescription: "Recommendation service Lambda errors > 5 in 5 min"
+        MetricName: Errors
+        Namespace: AWS/Lambda
+        Dimensions:
+          - Name: FunctionName
+            Value: !Ref RecommendationServiceLambdaFunction
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 5
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+
+    DLQDepthAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: cinecloud-dlq-depth-${self:custom.stage}
+        AlarmDescription: "Rating events DLQ has messages (failed processing)"
+        MetricName: ApproximateNumberOfMessagesVisible
+        Namespace: AWS/SQS
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt RatingEventsDLQ.QueueName
+        Statistic: Sum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+
+  # ── CloudFormation Outputs ────────────────
+  Outputs:
+    ApiGatewayUrl:
+      Description: "REST API base URL"
+      Value: !Sub "https://${ApiGatewayRestApi}.execute-api.${aws:region}.amazonaws.com/${self:custom.stage}"
+      Export:
+        Name: cinecloud-api-url-${self:custom.stage}
+
+    WebSocketUrl:
+      Description: "WebSocket API URL"
+      Value: !Sub "wss://${WebsocketsApi}.execute-api.${aws:region}.amazonaws.com/${self:custom.stage}"
+      Export:
+        Name: cinecloud-ws-url-${self:custom.stage}
+
+    CognitoUserPoolId:
+      Description: "Cognito User Pool ID"
+      Value: !Ref CognitoUserPool
+      Export:
+        Name: cinecloud-cognito-pool-${self:custom.stage}
+
+    CognitoClientId:
+      Description: "Cognito App Client ID"
+      Value: !Ref CognitoUserPoolClient
+      Export:
+        Name: cinecloud-cognito-client-${self:custom.stage}
+
+    CloudFrontDomain:
+      Description: "CloudFront distribution domain for assets"
+      Value: !GetAtt CloudFrontDistribution.DomainName
+      Export:
+        Name: cinecloud-cdn-domain-${self:custom.stage}

@@ -1,0 +1,18 @@
+{
+  "name": "cinecloud-backend",
+  "version": "1.0.0",
+  "description": "CineCloud — Serverless Cloud-Hosted Movie Recommendation Engine",
+  "scripts": {
+    "deploy": "serverless deploy --stage prod",
+    "deploy:dev": "serverless deploy --stage dev",
+    "remove": "serverless remove",
+    "logs:recommend": "serverless logs -f recommendationService -t",
+    "logs:rating": "serverless logs -f ratingService -t",
+    "local": "serverless offline start"
+  },
+  "devDependencies": {
+    "serverless": "^3.38.0",
+    "serverless-offline": "^13.3.0",
+    "serverless-python-requirements": "^6.1.0"
+  }
+}
