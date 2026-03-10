@@ -15,14 +15,14 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// On 401: clear stale token and redirect to sign-in
+// On 401: clear stale token and redirect to login
 api.interceptors.response.use(
   (res) => res,
   (error) => {
     if (error.response?.status === 401) {
       if (typeof window !== "undefined") {
         localStorage.removeItem("accessToken");
-        window.location.href = "/sign-in";
+        window.location.href = "/login";
       }
     }
     return Promise.reject(error);

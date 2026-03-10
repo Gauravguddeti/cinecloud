@@ -521,22 +521,39 @@ def recommendations_refresh(user_id):
 @app.route("/admin/ingest", methods=["POST"])
 def admin_ingest():
     body  = request.get_json() or {}
-    pages = min(int(body.get("pages", 3)), 20)
+    pages = min(int(body.get("pages", 3)), 50)
     if not TMDB_API_KEY:
         return jsonify({"error": "TMDB_API_KEY not set"}), 500
 
+    # TMDB endpoints to pull from: EN popular, EN top-rated, HI popular (Bollywood), HI top-rated
+    SOURCES = [
+        {"endpoint": "movie/popular",   "language": "en-US", "region": None},
+        {"endpoint": "movie/top_rated", "language": "en-US", "region": None},
+        {"endpoint": "movie/popular",   "language": "hi-IN", "region": "IN"},
+        {"endpoint": "movie/top_rated", "language": "hi-IN", "region": "IN"},
+    ]
+
     batch = []
-    for page in range(1, pages + 1):
+    seen  = set()
+    for source in SOURCES:
+      for page in range(1, pages + 1):
+        params = {"api_key": TMDB_API_KEY, "page": page, "language": source["language"]}
+        if source["region"]:
+            params["region"] = source["region"]
         resp = requests.get(
-            "https://api.themoviedb.org/3/movie/popular",
-            params={"api_key": TMDB_API_KEY, "page": page, "language": "en-US"},
+            f"https://api.themoviedb.org/3/{source['endpoint']}",
+            params=params,
             timeout=15,
         )
         if not resp.ok:
             continue
         for movie in resp.json().get("results", []):
+            mid = str(movie["id"])
+            if mid in seen:
+                continue
+            seen.add(mid)
             detail = requests.get(
-                f"https://api.themoviedb.org/3/movie/{movie['id']}",
+                f"https://api.themoviedb.org/3/movie/{mid}",
                 params={"api_key": TMDB_API_KEY, "append_to_response": "credits,keywords"},
                 timeout=15,
             )
@@ -547,7 +564,7 @@ def admin_ingest():
             cast   = [c["name"] for c in d.get("credits", {}).get("cast", [])[:10]]
             kws    = [k["name"] for k in d.get("keywords", {}).get("keywords", [])[:20]]
             batch.append({
-                "movie_id":       str(d["id"]),
+                "movie_id":       mid,
                 "title":          d.get("title", ""),
                 "title_lower":    d.get("title", "").lower(),
                 "overview":       d.get("overview", ""),
