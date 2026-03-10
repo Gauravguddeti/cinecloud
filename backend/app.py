@@ -591,6 +591,8 @@ def recommendations_refresh(user_id):
 #  ETL — TMDB INGEST
 # =============================================================
 
+_ingest_status = {"running": False, "total": 0, "message": "idle"}
+
 def _fetch_genre_map():
     """Fetch TMDB genre ID→name mapping once for EN and HI."""
     genre_map = {}
@@ -607,78 +609,87 @@ def _fetch_genre_map():
 
 @app.route("/admin/ingest", methods=["POST"])
 def admin_ingest():
+    global _ingest_status
+    if _ingest_status["running"]:
+        return jsonify({"message": "Ingest already running", "status": _ingest_status})
     body  = request.get_json() or {}
     pages = min(int(body.get("pages", 5)), 50)
     if not TMDB_API_KEY:
         return jsonify({"error": "TMDB_API_KEY not set"}), 500
+    # Run in background so Render's 30s timeout doesn't kill it
+    threading.Thread(target=_run_ingest, args=(pages,), daemon=True).start()
+    return jsonify({"message": f"Ingest started ({pages} pages × 4 sources)", "status": "started"})
 
-    # Fetch genre ID→name map once (2 requests total instead of per-movie)
-    genre_map = _fetch_genre_map()
+@app.route("/admin/ingest/status", methods=["GET"])
+def admin_ingest_status():
+    return jsonify(_ingest_status)
 
-    # Sources: EN popular, EN top-rated, HI popular (Bollywood), HI top-rated
-    SOURCES = [
-        {"endpoint": "movie/popular",   "language": "en-US", "region": None},
-        {"endpoint": "movie/top_rated", "language": "en-US", "region": None},
-        {"endpoint": "movie/popular",   "language": "hi-IN", "region": "IN"},
-        {"endpoint": "movie/top_rated", "language": "hi-IN", "region": "IN"},
-    ]
-
-    batch = []
-    seen  = set()
-    for source in SOURCES:
-        for page in range(1, pages + 1):
-            params = {"api_key": TMDB_API_KEY, "page": page, "language": source["language"]}
-            if source["region"]:
-                params["region"] = source["region"]
-            resp = requests.get(
-                f"https://api.themoviedb.org/3/{source['endpoint']}",
-                params=params,
-                timeout=15,
-            )
-            if not resp.ok:
-                continue
-            for movie in resp.json().get("results", []):
-                mid = str(movie["id"])
-                if mid in seen:
-                    continue
-                seen.add(mid)
-                # Use the list-page data directly — no per-movie detail call needed
-                genres = [genre_map.get(gid, "") for gid in movie.get("genre_ids", []) if gid in genre_map]
-                title  = movie.get("title") or movie.get("original_title", "")
-                batch.append({
-                    "movie_id":       mid,
-                    "title":          title,
-                    "title_lower":    title.lower(),
-                    "overview":       movie.get("overview", ""),
-                    "overview_lower": movie.get("overview", "").lower(),
-                    "genres":         genres,
-                    "cast_members":   [],
-                    "cast_search":    "",
-                    "keywords":       [],
-                    "poster_path":    movie.get("poster_path"),
-                    "backdrop_path":  movie.get("backdrop_path"),
-                    "release_year":   (movie.get("release_date") or "")[:4],
-                    "vote_average":   float(movie.get("vote_average", 0)),
-                    "vote_count":     int(movie.get("vote_count", 0)),
-                    "popularity":     float(movie.get("popularity", 0)),
-                    "runtime":        None,
-                    "updated_at":     datetime.utcnow(),
-                })
-            if len(batch) >= 500:
-                _write_pg_batch(batch)
-                batch = []
-
-    if batch:
-        _write_pg_batch(batch)
-
-    conn = _get_conn()
+def _run_ingest(pages: int):
+    global _ingest_status
+    _ingest_status = {"running": True, "total": 0, "message": "fetching genre map..."}
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM movies")
-            total = cur.fetchone()[0]
-    finally:
-        _put_conn(conn)
-    return jsonify({"message": f"Total movies in DB: {total}", "total": total})
+        genre_map = _fetch_genre_map()
+        SOURCES = [
+            {"endpoint": "movie/popular",   "language": "en-US", "region": None},
+            {"endpoint": "movie/top_rated", "language": "en-US", "region": None},
+            {"endpoint": "movie/popular",   "language": "hi-IN", "region": "IN"},
+            {"endpoint": "movie/top_rated", "language": "hi-IN", "region": "IN"},
+        ]
+        batch = []
+        seen  = set()
+        for source in SOURCES:
+            for page in range(1, pages + 1):
+                params = {"api_key": TMDB_API_KEY, "page": page, "language": source["language"]}
+                if source["region"]:
+                    params["region"] = source["region"]
+                resp = requests.get(
+                    f"https://api.themoviedb.org/3/{source['endpoint']}",
+                    params=params, timeout=15,
+                )
+                if not resp.ok:
+                    continue
+                for movie in resp.json().get("results", []):
+                    mid = str(movie["id"])
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    genres = [genre_map.get(gid, "") for gid in movie.get("genre_ids", []) if gid in genre_map]
+                    title  = movie.get("title") or movie.get("original_title", "")
+                    batch.append({
+                        "movie_id":       mid,
+                        "title":          title,
+                        "title_lower":    title.lower(),
+                        "overview":       movie.get("overview", ""),
+                        "overview_lower": movie.get("overview", "").lower(),
+                        "genres":         genres,
+                        "cast_members":   [],
+                        "cast_search":    "",
+                        "keywords":       [],
+                        "poster_path":    movie.get("poster_path"),
+                        "backdrop_path":  movie.get("backdrop_path"),
+                        "release_year":   (movie.get("release_date") or "")[:4],
+                        "vote_average":   float(movie.get("vote_average", 0)),
+                        "vote_count":     int(movie.get("vote_count", 0)),
+                        "popularity":     float(movie.get("popularity", 0)),
+                        "runtime":        None,
+                        "updated_at":     datetime.utcnow(),
+                    })
+                if len(batch) >= 500:
+                    _write_pg_batch(batch)
+                    batch = []
+            _ingest_status["message"] = f"processed {source['endpoint']} ({source['language']})"
+        if batch:
+            _write_pg_batch(batch)
+        conn = _get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM movies")
+                total = cur.fetchone()[0]
+        finally:
+            _put_conn(conn)
+        _ingest_status = {"running": False, "total": total, "message": f"Done — {total} movies in DB"}
+    except Exception as e:
+        _ingest_status = {"running": False, "total": 0, "message": f"Error: {e}"}
 
 
 def _write_pg_batch(movies):
