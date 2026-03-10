@@ -143,6 +143,17 @@ export default function ProfilePage() {
               <MovieCard key={rec.movieId} movie={rec} reason={rec.reason} />
             ))}
           </div>
+        ) : ratedMovies.length > 0 ? (
+          <div className="text-center py-12 text-gray-400 border border-dashed border-brand-border rounded-xl">
+            <p className="mb-2">Your picks are being computed…</p>
+            <button
+              onClick={handleRefresh}
+              disabled={refreshing}
+              className="text-sm text-brand-red hover:underline disabled:opacity-50"
+            >
+              {refreshing ? "Refreshing…" : "Refresh picks →"}
+            </button>
+          </div>
         ) : (
           <div className="text-center py-12 text-gray-400 border border-dashed border-brand-border rounded-xl">
             <p>Rate some movies to see your personalised picks here!</p>

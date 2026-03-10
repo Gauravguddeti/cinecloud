@@ -131,6 +131,13 @@ def init_db():
             # Fuzzy search — safe to run multiple times
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_movies_title_trgm ON movies USING gin(title_lower gin_trgm_ops);")
+            # Clean up null genre elements left by old code (safe to run repeatedly)
+            cur.execute("""
+                UPDATE movies
+                SET genres = ARRAY(SELECT elem FROM UNNEST(genres) AS elem WHERE elem IS NOT NULL AND elem != '')
+                WHERE genres IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM UNNEST(genres) AS elem WHERE elem IS NULL OR elem = '')
+            """)
             conn.commit()
         print("[db] Tables ready")
     except Exception as e:
@@ -601,7 +608,7 @@ def _movie_resp(row):
         "title":        row.get("title", ""),
         "titleLower":   row.get("title_lower", ""),
         "overview":     row.get("overview", ""),
-        "genres":       row.get("genres") or [],
+        "genres":       [g for g in (row.get("genres") or []) if g],
         "cast":         row.get("cast_members") or [],
         "castSearch":   row.get("cast_search", ""),
         "keywords":     row.get("keywords") or [],
@@ -648,7 +655,7 @@ def ratings_submit():
         return jsonify({"error": str(e)}), 500
     finally:
         _put_conn(conn)
-    threading.Thread(target=_recompute_recs, args=(uid,), daemon=True).start()
+    threading.Thread(target=_enrich_and_recompute, args=(uid, movie_id), daemon=True).start()
     data = {"userId": uid, "movieId": movie_id, "rating": rating, "ratedAt": now.isoformat()}
     return jsonify({"message": "Rating submitted", "rating": data})
 
@@ -1088,6 +1095,79 @@ def _load_movies_metadata():
 #  RECOMMENDATION ALGORITHM  — Hybrid CF (70%) + CBF (30%)
 # =============================================================
 
+def _ensure_movie_in_db(movie_id: str):
+    """Fetch full TMDB data (genres, cast, keywords) for a movie and upsert into movies table.
+    Movies found via live TMDB search are stored with empty cast/keywords — this fixes that."""
+    if movie_id.startswith("tv_"):
+        return
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM movies
+                WHERE movie_id = %s
+                  AND genres IS NOT NULL
+                  AND cardinality(genres) > 0
+                  AND genres[1] IS NOT NULL
+            """, (movie_id,))
+            if cur.fetchone():
+                return  # Already has proper genre data
+    finally:
+        _put_conn(conn)
+    try:
+        mr = requests.get(
+            f"https://api.themoviedb.org/3/movie/{movie_id}",
+            params={"api_key": TMDB_API_KEY, "language": "en-US"},
+            timeout=10,
+        )
+        if not mr.ok:
+            return
+        m = mr.json()
+        genres = [g["name"] for g in m.get("genres", [])]
+        cr = requests.get(
+            f"https://api.themoviedb.org/3/movie/{movie_id}/credits",
+            params={"api_key": TMDB_API_KEY},
+            timeout=10,
+        )
+        cast_members = [c["name"] for c in cr.json().get("cast", [])[:10]] if cr.ok else []
+        kr = requests.get(
+            f"https://api.themoviedb.org/3/movie/{movie_id}/keywords",
+            params={"api_key": TMDB_API_KEY},
+            timeout=10,
+        )
+        keywords = [k["name"] for k in kr.json().get("keywords", [])[:20]] if kr.ok else []
+        title = m.get("title") or m.get("original_title", "")
+        _write_pg_batch([{
+            "movie_id":       movie_id,
+            "title":          title,
+            "title_lower":    title.lower(),
+            "overview":       m.get("overview", ""),
+            "overview_lower": m.get("overview", "").lower(),
+            "genres":         genres,
+            "cast_members":   cast_members,
+            "cast_search":    " ".join(cast_members).lower(),
+            "keywords":       keywords,
+            "poster_path":    m.get("poster_path"),
+            "backdrop_path":  m.get("backdrop_path"),
+            "release_year":   (m.get("release_date") or "")[:4],
+            "vote_average":   float(m.get("vote_average", 0)),
+            "vote_count":     int(m.get("vote_count", 0)),
+            "popularity":     float(m.get("popularity", 0)),
+            "runtime":        m.get("runtime"),
+            "updated_at":     datetime.utcnow(),
+        }])
+        print(f"[ensure_movie] Saved full TMDB data for {movie_id}: {title} genres={genres}")
+    except Exception as e:
+        print(f"[ensure_movie] {movie_id}: {e}")
+
+
+def _enrich_and_recompute(user_id: str, movie_id: str):
+    """Ensure rated movie is in DB with full details, then recompute recs.
+    Runs in a background thread after rating submit."""
+    _ensure_movie_in_db(movie_id)
+    _recompute_recs(user_id)
+
+
 def _recompute_recs(user_id):
     """Background thread worker."""
     try:
@@ -1134,7 +1214,9 @@ def _collaborative_filter(user_id, all_ratings, top_k=15):
 
 def _movie_feature_vector(movie):
     tf = defaultdict(float)
-    for g  in movie.get("genres", []):
+    for g in (movie.get("genres") or []):
+        if not g:
+            continue
         tf[f"genre:{g.lower().replace(' ', '_')}"] += 3.0
     for a in (movie.get("cast") or [])[:5]:
         tf[f"cast:{a.lower().replace(' ', '_')}"]  += 2.0
