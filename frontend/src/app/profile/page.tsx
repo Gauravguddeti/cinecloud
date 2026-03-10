@@ -2,21 +2,37 @@
 
 import { useEffect, useState } from "react";
 import { useStore } from "@/lib/store";
-import { recommendationsApi } from "@/lib/api";
+import { recommendationsApi, moviesApi } from "@/lib/api";
 import { MovieCard } from "@/components/MovieCard";
+import { StarRating } from "@/components/StarRating";
 import { useRouter } from "next/navigation";
 import toast from "react-hot-toast";
-import type { Recommendation } from "@/lib/types";
+import type { Movie, Recommendation } from "@/lib/types";
 
 export default function ProfilePage() {
-  const { user, isAuthenticated, recommendations, ratings, loadRecommendations } = useStore();
+  const { user, isAuthenticated, recommendations, ratings, loadRecommendations, setSelectedMovie } = useStore();
   const router = useRouter();
   const [refreshing, setRefreshing] = useState(false);
+  const [ratedMovieDetails, setRatedMovieDetails] = useState<Movie[]>([]);
+  const [loadingDetails, setLoadingDetails] = useState(false);
 
   useEffect(() => {
     if (!isAuthenticated) { router.push("/login"); return; }
     loadRecommendations();
   }, [isAuthenticated, router, loadRecommendations]);
+
+  // Re-fetch movie details whenever the ratings map changes (add/remove/edit)
+  useEffect(() => {
+    const ids = Object.keys(ratings);
+    if (ids.length === 0) { setRatedMovieDetails([]); return; }
+    setLoadingDetails(true);
+    Promise.all(
+      ids.map((id) => moviesApi.get(id).then(({ data }) => data.movie).catch(() => null))
+    ).then((results) => {
+      setRatedMovieDetails(results.filter(Boolean) as Movie[]);
+      setLoadingDetails(false);
+    });
+  }, [ratings]);
 
   const handleRefresh = async () => {
     if (!user) return;
@@ -71,6 +87,52 @@ export default function ProfilePage() {
         />
         <StatCard label="Algorithm" value="Hybrid CF+CBF" icon="🧠" />
       </div>
+
+      {/* Your Rated Movies */}
+      {ratedMovies.length > 0 && (
+        <section className="mb-10">
+          <h2 className="text-xl font-bold mb-4">Your Rated Movies</h2>
+          {loadingDetails ? (
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+              {ratedMovies.map(([id]) => (
+                <div key={id} className="animate-pulse">
+                  <div className="aspect-[2/3] bg-brand-card rounded-lg" />
+                  <div className="h-3 bg-white/10 rounded mt-2 w-3/4" />
+                  <div className="h-3 bg-white/10 rounded mt-1 w-1/2" />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+              {ratedMovieDetails.map((movie) => (
+                <div key={movie.movieId} className="flex flex-col gap-2">
+                  <div
+                    className="relative cursor-pointer rounded-lg overflow-hidden group"
+                    onClick={() => setSelectedMovie(movie)}
+                  >
+                    {movie.posterPath ? (
+                      <img
+                        src={movie.posterPath}
+                        alt={movie.title}
+                        className="w-full aspect-[2/3] object-cover group-hover:scale-105 transition-transform duration-200"
+                      />
+                    ) : (
+                      <div className="w-full aspect-[2/3] bg-brand-card flex items-center justify-center text-gray-500 text-xs text-center px-2">
+                        {movie.title}
+                      </div>
+                    )}
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-2">
+                      <span className="text-xs text-white">View details</span>
+                    </div>
+                  </div>
+                  <p className="text-xs font-medium leading-tight line-clamp-2">{movie.title}</p>
+                  <StarRating movieId={movie.movieId} size="sm" />
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
 
       {/* Recommendations */}
       <section className="mb-10">

@@ -374,59 +374,106 @@ def movies_search():
                     popularity DESC
                 LIMIT 20
             """, (
-                q, f"%{q}%", f"%{q}%",   # WHERE
-                q, f"{q}%", f"%{q}%",    # ORDER CASE
-                q,                        # final similarity sort
+                q, f"%{q}%", f"%{q}%",
+                q, f"{q}%", f"%{q}%",
+                q,
             ))
-            movies = [_movie_resp(dict(r)) for r in cur.fetchall()]
-
-        # If sparse results, fire background TMDB import — returns instantly, next search will find them
-        if len(movies) < 4 and TMDB_API_KEY:
-            threading.Thread(target=_background_tmdb_import, args=(q,), daemon=True).start()
-
-        return jsonify({"movies": movies, "count": len(movies)})
+            db_movies = [_movie_resp(dict(r)) for r in cur.fetchall()]
     finally:
         _put_conn(conn)
 
+    # If sparse DB results, query TMDB synchronously so user sees real results NOW
+    if len(db_movies) < 4 and TMDB_API_KEY:
+        tmdb_resp, raw_batch = _tmdb_live_search(q)
+        db_ids = {m["movieId"] for m in db_movies}
+        extra  = [m for m in tmdb_resp if m["movieId"] not in db_ids]
+        movies = db_movies + extra
+        # Persist new movies to DB in background so future searches are instant
+        if raw_batch:
+            threading.Thread(target=_background_tmdb_import, args=(raw_batch,), daemon=True).start()
+    else:
+        movies = db_movies
 
-def _background_tmdb_import(query: str):
-    """Fetch from TMDB for a search query and upsert into DB without blocking the response."""
+    return jsonify({"movies": movies[:20], "count": len(movies[:20])})
+
+
+def _tmdb_live_search(query: str):
+    """Search TMDB for query (en + hi) and return (response-shaped list, raw upsert batch)."""
     genre_map = _fetch_genre_map()
-    try:
-        for lang in ("en-US", "hi-IN"):
-            resp = requests.get(
+    resp_movies, raw_batch, seen = [], [], set()
+    for lang in ("en-US", "hi-IN"):
+        try:
+            r = requests.get(
                 "https://api.themoviedb.org/3/search/movie",
                 params={"api_key": TMDB_API_KEY, "query": query, "language": lang, "page": 1},
-                timeout=10,
+                timeout=8,
             )
-            if not resp.ok:
+        except Exception:
+            continue
+        if not r.ok:
+            continue
+        for item in r.json().get("results", [])[:10]:
+            mid = str(item["id"])
+            if mid in seen:
                 continue
-            batch = []
-            for item in resp.json().get("results", [])[:10]:
-                mid   = str(item["id"])
-                title = item.get("title") or item.get("original_title", "")
-                genres = [genre_map.get(gid, "") for gid in item.get("genre_ids", []) if gid in genre_map]
-                batch.append({
-                    "movie_id":       mid,
-                    "title":          title,
-                    "title_lower":    title.lower(),
-                    "overview":       item.get("overview", ""),
-                    "overview_lower": item.get("overview", "").lower(),
-                    "genres":         genres,
-                    "cast_members":   [],
-                    "cast_search":    "",
-                    "keywords":       [],
-                    "poster_path":    item.get("poster_path"),
-                    "backdrop_path":  item.get("backdrop_path"),
-                    "release_year":   (item.get("release_date") or "")[:4],
-                    "vote_average":   float(item.get("vote_average", 0)),
-                    "vote_count":     int(item.get("vote_count", 0)),
-                    "popularity":     float(item.get("popularity", 0)),
-                    "runtime":        None,
-                    "updated_at":     datetime.utcnow(),
-                })
-            if batch:
-                _write_pg_batch(batch)
+            seen.add(mid)
+            title  = item.get("title") or item.get("original_title", "")
+            genres = [genre_map.get(gid, "") for gid in item.get("genre_ids", []) if gid in genre_map]
+            poster_path   = item.get("poster_path")
+            backdrop_path = item.get("backdrop_path")
+            release_year  = (item.get("release_date") or "")[:4]
+            raw_batch.append({
+                "movie_id":       mid,
+                "title":          title,
+                "title_lower":    title.lower(),
+                "overview":       item.get("overview", ""),
+                "overview_lower": item.get("overview", "").lower(),
+                "genres":         genres,
+                "cast_members":   [],
+                "cast_search":    "",
+                "keywords":       [],
+                "poster_path":    poster_path,
+                "backdrop_path":  backdrop_path,
+                "release_year":   release_year,
+                "vote_average":   float(item.get("vote_average", 0)),
+                "vote_count":     int(item.get("vote_count", 0)),
+                "popularity":     float(item.get("popularity", 0)),
+                "runtime":        None,
+                "updated_at":     datetime.utcnow(),
+            })
+            resp_movies.append({
+                "movieId":      mid,
+                "title":        title,
+                "titleLower":   title.lower(),
+                "overview":     item.get("overview", ""),
+                "genres":       genres,
+                "cast":         [],
+                "castSearch":   "",
+                "keywords":     [],
+                "posterPath":   ("https://image.tmdb.org/t/p/w500" + poster_path) if poster_path else None,
+                "backdropPath": ("https://image.tmdb.org/t/p/w1280" + backdrop_path) if backdrop_path else None,
+                "releaseYear":  release_year,
+                "voteAverage":  float(item.get("vote_average", 0)),
+                "voteCount":    int(item.get("vote_count", 0)),
+                "popularity":   float(item.get("popularity", 0)),
+                "runtime":      None,
+            })
+    return resp_movies, raw_batch
+
+
+def _background_tmdb_import(raw_batch: list):
+    """Upsert a pre-built batch into DB without blocking the response."""
+    if not raw_batch:
+        return
+    try:
+        dsn = DATABASE_URL
+        if "sslmode" not in dsn:
+            dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
+        conn = psycopg2.connect(dsn)
+        try:
+            _flush_batch(conn, raw_batch)
+        finally:
+            conn.close()
     except Exception as e:
         print(f"[bg_import] {e}")
 
