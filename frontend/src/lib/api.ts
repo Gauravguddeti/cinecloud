@@ -6,23 +6,34 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
 const api = axios.create({ baseURL: API_URL });
 
-// Attach Clerk JWT (stored by AppProvider) on every request
-api.interceptors.request.use((config) => {
+// AppProvider registers Clerk's getToken here so interceptor always gets a fresh JWT
+let _getToken: (() => Promise<string | null>) | null = null;
+export function setTokenProvider(fn: () => Promise<string | null>) {
+  _getToken = fn;
+}
+
+// Attach fresh Clerk JWT on every request (avoids short-lived JWT expiry issues)
+api.interceptors.request.use(async (config) => {
   if (typeof window !== "undefined") {
-    const token = localStorage.getItem("accessToken");
+    let token: string | null = null;
+    if (_getToken) {
+      token = await _getToken();
+      if (token) localStorage.setItem("accessToken", token);
+    } else {
+      token = localStorage.getItem("accessToken");
+    }
     if (token) config.headers.Authorization = `Bearer ${token}`;
   }
   return config;
 });
 
-// On 401: clear stale token and redirect to login
+// On 401: clear cached token — Clerk SDK will handle session state, no hard redirect
 api.interceptors.response.use(
   (res) => res,
   (error) => {
     if (error.response?.status === 401) {
       if (typeof window !== "undefined") {
         localStorage.removeItem("accessToken");
-        window.location.href = "/login";
       }
     }
     return Promise.reject(error);

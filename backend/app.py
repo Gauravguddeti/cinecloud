@@ -318,20 +318,31 @@ def _user_resp(row):
 
 @app.route("/movies/list", methods=["GET"])
 def movies_list():
-    genre = request.args.get("genre")
-    limit = min(int(request.args.get("limit", 50)), 200)
-    conn  = _get_conn()
+    genre      = request.args.get("genre")
+    limit      = min(int(request.args.get("limit", 50)), 200)
+    next_token = request.args.get("nextToken")
+    offset     = int(next_token) if next_token and next_token.isdigit() else 0
+    conn       = _get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             if genre:
                 cur.execute(
-                    "SELECT * FROM movies WHERE %s = ANY(genres) ORDER BY popularity DESC LIMIT %s",
-                    (genre, limit),
+                    "SELECT * FROM movies WHERE %s = ANY(genres) ORDER BY popularity DESC LIMIT %s OFFSET %s",
+                    (genre, limit, offset),
                 )
             else:
-                cur.execute("SELECT * FROM movies ORDER BY popularity DESC LIMIT %s", (limit,))
+                cur.execute(
+                    "SELECT * FROM movies ORDER BY popularity DESC LIMIT %s OFFSET %s",
+                    (limit, offset),
+                )
             movies = [_movie_resp(dict(r)) for r in cur.fetchall()]
-        return jsonify({"movies": movies, "count": len(movies)})
+        next_offset = offset + len(movies)
+        has_more    = len(movies) == limit
+        return jsonify({
+            "movies":    movies,
+            "count":     len(movies),
+            "nextToken": str(next_offset) if has_more else None,
+        })
     finally:
         _put_conn(conn)
 
@@ -353,6 +364,66 @@ def movies_search():
                 LIMIT 50
             """, (f"%{q}%", f"%{q}%", f"%{q}%"))
             movies = [_movie_resp(dict(r)) for r in cur.fetchall()]
+
+        # If fewer than 5 results, fall back to live TMDB search and ingest new movies
+        if len(movies) < 5 and TMDB_API_KEY:
+            tmdb_resp = requests.get(
+                "https://api.themoviedb.org/3/search/movie",
+                params={"api_key": TMDB_API_KEY, "query": q, "language": "en-US", "page": 1},
+                timeout=10,
+            )
+            if tmdb_resp.ok:
+                existing_ids = {m["movieId"] for m in movies}
+                batch = []
+                for item in tmdb_resp.json().get("results", [])[:20]:
+                    mid = str(item["id"])
+                    if mid in existing_ids:
+                        continue
+                    detail = requests.get(
+                        f"https://api.themoviedb.org/3/movie/{mid}",
+                        params={"api_key": TMDB_API_KEY, "append_to_response": "credits,keywords"},
+                        timeout=10,
+                    )
+                    if not detail.ok:
+                        continue
+                    d = detail.json()
+                    genres = [g["name"] for g in d.get("genres", [])]
+                    cast   = [c["name"] for c in d.get("credits", {}).get("cast", [])[:10]]
+                    kws    = [k["name"] for k in d.get("keywords", {}).get("keywords", [])[:20]]
+                    batch.append({
+                        "movie_id":       mid,
+                        "title":          d.get("title", ""),
+                        "title_lower":    d.get("title", "").lower(),
+                        "overview":       d.get("overview", ""),
+                        "overview_lower": d.get("overview", "").lower(),
+                        "genres":         genres,
+                        "cast_members":   cast,
+                        "cast_search":    " ".join(cast).lower(),
+                        "keywords":       kws,
+                        "poster_path":    d.get("poster_path"),
+                        "backdrop_path":  d.get("backdrop_path"),
+                        "release_year":   (d.get("release_date") or "")[:4],
+                        "vote_average":   float(d.get("vote_average", 0)),
+                        "vote_count":     int(d.get("vote_count", 0)),
+                        "popularity":     float(d.get("popularity", 0)),
+                        "runtime":        d.get("runtime"),
+                        "updated_at":     datetime.utcnow(),
+                    })
+                if batch:
+                    _write_pg_batch(batch)
+                    # Re-query so freshly ingested results are included
+                    conn2 = _get_conn()
+                    try:
+                        with conn2.cursor(cursor_factory=RealDictCursor) as cur2:
+                            cur2.execute("""
+                                SELECT * FROM movies
+                                WHERE title_lower LIKE %s OR cast_search LIKE %s
+                                ORDER BY popularity DESC LIMIT 50
+                            """, (f"%{q}%", f"%{q}%"))
+                            movies = [_movie_resp(dict(r)) for r in cur2.fetchall()]
+                    finally:
+                        _put_conn(conn2)
+
         return jsonify({"movies": movies, "count": len(movies)})
     finally:
         _put_conn(conn)

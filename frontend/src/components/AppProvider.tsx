@@ -5,7 +5,7 @@ import { useUser, useAuth } from "@clerk/nextjs";
 import { useStore } from "@/lib/store";
 import { useRealtimeRecs } from "@/hooks/useRealtimeRecs";
 import { MovieDetailModal } from "@/components/MovieDetailModal";
-import { authApi } from "@/lib/api";
+import { authApi, setTokenProvider } from "@/lib/api";
 
 /**
  * AppProvider — syncs Clerk auth state to store + NeonDB.
@@ -16,6 +16,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const { user: clerkUser, isSignedIn, isLoaded } = useUser();
   const { getToken } = useAuth();
   const { setUser, user, selectedMovie, setSelectedMovie, loadRatings, loadRecommendations } = useStore();
+
+  // Register Clerk's getToken so every axios request gets a fresh JWT (prevents expiry redirects)
+  useEffect(() => {
+    setTokenProvider(getToken);
+  }, [getToken]);
 
   useEffect(() => {
     if (!isLoaded) return;
