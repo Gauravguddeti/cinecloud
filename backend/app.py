@@ -41,7 +41,7 @@ TMDB_API_KEY       = os.environ.get("TMDB_API_KEY", "")
 TOP_N              = 20
 CF_WEIGHT          = 0.60
 CBF_WEIGHT         = 0.40
-MIN_RATINGS_FOR_CF = 3
+MIN_RATINGS_FOR_CF = 5   # need ≥5 ratings before sparse cosine vectors are reliable
 CACHE_TTL_REDIS    = 1800   # 30 min
 CACHE_TTL_DB       = 86400  # 24 h
 # Quality gates for recommendations
@@ -1523,7 +1523,16 @@ def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N, 
         if not movie or not _passes_quality_gate(movie):
             continue
 
-        relevance      = cf_norm.get(mid, 0) * CF_WEIGHT + cbf_norm.get(mid, 0) * CBF_WEIGHT
+        # Dynamic relevance: use CBF at full weight when CF is absent so it isn't
+        # crushed to 0.40×0.55=0.22 while quality+franchise dominate the score.
+        cf_score  = cf_norm.get(mid, 0)
+        cbf_score = cbf_norm.get(mid, 0)
+        if cf_score > 0 and cbf_score > 0:
+            relevance = cf_score * CF_WEIGHT + cbf_score * CBF_WEIGHT
+        elif cbf_score > 0:
+            relevance = cbf_score          # CBF-only: give it the full relevance slot
+        else:
+            relevance = cf_score * CF_WEIGHT
         quality        = _quality_score(movie)
         implicit_score = max(impl_norm.get(mid, 0), impl_cbf_norm.get(mid, 0))
 

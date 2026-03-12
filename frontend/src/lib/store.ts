@@ -42,7 +42,8 @@ export const useStore = create<AppState>((set, get) => ({
     if (!user) return;
     await ratingsApi.submit(movieId, rating);
     set((state) => ({ ratings: { ...state.ratings, [movieId]: rating } }));
-    // Recommendations are refreshed via polling in useRealtimeRecs
+    // Background thread on server takes ~2-3 s to recompute; reload after that.
+    setTimeout(() => get().loadRecommendations(), 3500);
   },
 
   deleteRating: async (movieId) => {
@@ -61,6 +62,12 @@ export const useStore = create<AppState>((set, get) => ({
     if (!user) return;
     await ratingsApi.resetRatings();
     set({ ratings: {}, recommendations: [] });
+    // Force-clear Redis cache and pull fresh recs immediately.
+    // Without this, old cached recommendations survive for up to 30 min.
+    try {
+      const { data } = await recommendationsApi.refresh(user.userId);
+      set({ recommendations: data.recommendations ?? [], recsFromCache: false });
+    } catch {}
   },
 
   loadRatings: async () => {
