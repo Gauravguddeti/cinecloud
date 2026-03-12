@@ -6,3 +6,5 @@ cryptography==42.0.5
 requests==2.31.0
 redis==5.0.4
 gunicorn==22.0.0
+numpy==1.26.4
+rank-bm25==0.2.2

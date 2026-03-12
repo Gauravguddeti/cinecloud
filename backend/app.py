@@ -16,6 +16,7 @@ import threading
 import time
 from collections import defaultdict
 from datetime import datetime
+from difflib import SequenceMatcher
 
 import psycopg2
 from psycopg2 import pool as pg_pool
@@ -33,6 +34,13 @@ try:
 except ImportError:
     _redis_available = False
 
+try:
+    from rank_bm25 import BM25Okapi as _BM25Okapi
+    _bm25_available = True
+except ImportError:
+    _BM25Okapi = None
+    _bm25_available = False
+
 # ── Config ────────────────────────────────────────────────────
 DATABASE_URL       = os.environ.get("DATABASE_URL", "")
 CLERK_JWKS_URL     = os.environ.get("CLERK_JWKS_URL", "")
@@ -41,7 +49,7 @@ TMDB_API_KEY       = os.environ.get("TMDB_API_KEY", "")
 TOP_N              = 20
 CF_WEIGHT          = 0.60
 CBF_WEIGHT         = 0.40
-MIN_RATINGS_FOR_CF = 5   # need ≥5 ratings before sparse cosine vectors are reliable
+MIN_RATINGS_FOR_CF = 3   # Pearson correlation is robust enough at 3 shared ratings
 CACHE_TTL_REDIS    = 1800   # 30 min
 CACHE_TTL_DB       = 86400  # 24 h
 # Quality gates for recommendations
@@ -378,16 +386,16 @@ def movies_search():
     if not q:
         return jsonify({"movies": [], "count": 0})
 
-    # In-memory cache — same query within 60 s returns instantly (prevents TMDB hammering on debounce)
+    # In-memory cache — same query within 60 s returns instantly
     now    = time.time()
     cached = _search_cache.get(q)
     if cached and (now - cached["ts"]) < 60:
         return jsonify({"movies": cached["movies"], "count": len(cached["movies"])})
 
+    # ── Step 1: DB fetch via pg_trgm (handles typos, partial matches) ─────────
     conn = _get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Fuzzy trigram + LIKE hybrid — tolerates typos (jumannjai → Jumanji)
             cur.execute("""
                 SELECT *
                 FROM movies
@@ -401,32 +409,88 @@ def movies_search():
                          ELSE 1 END DESC,
                     word_similarity(%s, title_lower) DESC,
                     popularity DESC
-                LIMIT 20
+                LIMIT 40
             """, (
                 q, f"%{q}%", f"%{q}%",
                 q, f"{q}%", f"%{q}%",
                 q,
             ))
-            db_movies = [_movie_resp(dict(r)) for r in cur.fetchall()]
+            db_rows = [dict(r) for r in cur.fetchall()]
     finally:
         _put_conn(conn)
 
-    # Go to TMDB when there's no direct substring match in DB titles
-    # (fuzzy can return 4+ irrelevant results, e.g. "lagaan" matching unrelated films)
-    has_direct_match = any(q in m.get("titleLower", "") for m in db_movies)
+    db_movies = [_movie_resp(r) for r in db_rows]
+
+    # ── Step 2: TMDB live search when no direct title match in DB ─────────────
+    has_direct_match = any(q in (m.get("titleLower") or m.get("title", "").lower()) for m in db_movies)
     if not has_direct_match and TMDB_API_KEY:
         tmdb_resp, raw_batch = _tmdb_live_search(q)
         db_ids = {m["movieId"] for m in db_movies}
         extra  = [m for m in tmdb_resp if m["movieId"] not in db_ids]
-        movies = db_movies + extra
+        db_movies = db_movies + extra
         if raw_batch:
             threading.Thread(target=_background_tmdb_import, args=(raw_batch,), daemon=True).start()
-    else:
-        movies = db_movies
 
-    result = movies[:20]
+    if not db_movies:
+        result = []
+        _search_cache[q] = {"movies": result, "ts": now}
+        return jsonify({"movies": result, "count": 0})
+
+    # ── Step 3: BM25 re-ranking over title + overview + keywords + cast ───────
+    # Build a corpus from the candidates and re-score them using BM25Okapi.
+    # This promotes exact-word matches and handles term frequency properly,
+    # making "Interstellar" rank above "Stella" for query "interstellar".
+    def _tokenize(text: str) -> list:
+        return (text or "").lower().split()
+
+    def _doc_for(m: dict) -> list:
+        parts = [
+            m.get("title", "") * 3,          # title gets triple weight in corpus
+            " ".join(m.get("genres") or []),
+            " ".join((m.get("cast") or [])[:5]),
+            " ".join((m.get("keywords") or [])[:10]),
+            m.get("overview", "") or "",
+        ]
+        return _tokenize(" ".join(parts))
+
+    corpus  = [_doc_for(m) for m in db_movies]
+    q_tokens = _tokenize(q)
+
+    if _bm25_available and any(corpus):
+        bm25    = _BM25Okapi(corpus)
+        bm25_scores = bm25.get_scores(q_tokens)
+    else:
+        # Fallback: simple TF score (counts query tokens in doc)
+        bm25_scores = [
+            sum(1 for tok in q_tokens if tok in doc)
+            for doc in corpus
+        ]
+
+    # ── Step 4: Fuzzy title similarity as tiebreaker / fallback ──────────────
+    # SequenceMatcher gives 0.0–1.0 character-level similarity.
+    # Used as secondary signal when BM25 scores are equal or near-zero.
+    def _fuzzy(title: str) -> float:
+        return SequenceMatcher(None, q, title.lower()).ratio()
+
+    # ── Step 5: Exact-prefix bonus — "inter" should rank "Interstellar" first ─
+    def _prefix_bonus(title: str) -> float:
+        return 2.0 if title.lower().startswith(q) else 0.0
+
+    # Combine: BM25 (normalised) × 0.65 + fuzzy × 0.20 + prefix bonus × 0.15
+    max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
+    ranked = []
+    for i, movie in enumerate(db_movies):
+        bm25_norm = bm25_scores[i] / max_bm25
+        fuzzy_s   = _fuzzy(movie.get("title", ""))
+        prefix_b  = _prefix_bonus(movie.get("title", ""))
+        combined  = bm25_norm * 0.65 + fuzzy_s * 0.20 + prefix_b * 0.15
+        ranked.append((combined, movie))
+
+    ranked.sort(key=lambda x: -x[0])
+    result = [m for _, m in ranked[:20]]
+
     _search_cache[q] = {"movies": result, "ts": now}
-    # Prune entries older than 5 min to prevent unbounded growth
+    # Prune stale entries
     stale = [k for k, v in list(_search_cache.items()) if (now - v["ts"]) > 300]
     for k in stale:
         _search_cache.pop(k, None)
@@ -1320,12 +1384,22 @@ def _detect_franchise(movie):
 
 
 def _quality_score(movie):
-    """0.0–1.0 quality signal: sigmoid on voteAverage (centred 7.0) + log-scaled voteCount."""
+    """Wilson score lower bound — statistically principled quality estimate.
+    Treats each vote as a Bernoulli trial: voteAverage/10 = p, voteCount = n.
+    A movie with 3×10★ can never beat one with 10 000×8★. No manual tuning needed.
+    """
     avg   = float(movie.get("voteAverage") or 0)
     count = int(movie.get("voteCount") or 0)
-    avg_score   = 1.0 / (1.0 + math.exp(-1.5 * (avg - 7.0)))
-    count_score = math.log1p(min(count, 50_000)) / math.log1p(50_000)
-    return round(0.6 * avg_score + 0.4 * count_score, 4)
+    if count == 0:
+        return 0.0
+    p   = avg / 10.0            # proportion (0–1)
+    z   = 1.96                  # 95% confidence
+    n   = float(count)
+    # Wilson lower bound
+    centre = (p + z*z / (2*n))
+    spread = z * math.sqrt(p*(1-p)/n + z*z/(4*n*n))
+    denom  = 1 + z*z / n
+    return round((centre - spread) / denom, 4)
 
 
 def _passes_quality_gate(movie):
@@ -1349,16 +1423,34 @@ def _cosine_similarity(vec_a, vec_b):
 
 
 def _collaborative_filter(user_id, all_ratings, top_k=15):
+    """Pearson-correlation CF — corrects for per-user rating bias (generous vs stingy raters).
+    Only considers movies both users have actually rated (no zero-padding).
+    More reliable than cosine similarity especially with sparse data.
+    """
     user_ratings = all_ratings.get(user_id, {})
     if len(user_ratings) < MIN_RATINGS_FOR_CF:
         return {}
+
+    # Pearson correlation between two rating dicts (shared movies only)
+    def _pearson(r_a: dict, r_b: dict) -> float:
+        common = set(r_a) & set(r_b)
+        if len(common) < 2:          # need at least 2 shared items
+            return 0.0
+        n    = len(common)
+        mean_a = sum(r_a[m] for m in common) / n
+        mean_b = sum(r_b[m] for m in common) / n
+        num  = sum((r_a[m] - mean_a) * (r_b[m] - mean_b) for m in common)
+        den  = (math.sqrt(sum((r_a[m] - mean_a) ** 2 for m in common)) *
+                math.sqrt(sum((r_b[m] - mean_b) ** 2 for m in common)))
+        return num / den if den > 0 else 0.0
+
     sims = []
     for other_id, other_r in all_ratings.items():
         if other_id == user_id:
             continue
-        s = _cosine_similarity(user_ratings, other_r)
-        if s > 0:
-            sims.append((s, other_id))
+        p = _pearson(user_ratings, other_r)
+        if p > 0:
+            sims.append((p, other_id))
     sims.sort(reverse=True)
     scores, sim_sums = defaultdict(float), defaultdict(float)
     for sim, other_id in sims[:top_k]:
@@ -1372,20 +1464,23 @@ def _collaborative_filter(user_id, all_ratings, top_k=15):
 def _movie_feature_vector(movie):
     tf = defaultdict(float)
     # Franchise / universe membership — highest weight (5.0).
-    # Ensures MCU fan sees MCU movies, Star Wars fan sees Star Wars, etc.
     for fkey in _detect_franchise(movie):
         tf[fkey] += 5.0
-    # Genre — strong signal (3.0)
+    # Director — very specific signal, nearly as strong as franchise (3.5)
+    director = (movie.get("director") or "").strip().lower().replace(" ", "_")
+    if director:
+        tf[f"dir:{director}"] += 3.5
+    # Genre — lowered from 3.0 → 1.5 to reduce catch-all tag inflation (Adventure, etc.)
     for g in (movie.get("genres") or []):
         if not g:
             continue
-        tf[f"genre:{g.lower().replace(' ', '_')}"] += 3.0
-    # Lead cast — medium signal (2.0)
+        tf[f"genre:{g.lower().replace(' ', '_')}"] += 1.5
+    # Lead cast — raised slightly (2.5) — specific actors are strong taste signals
     for a in (movie.get("cast") or [])[:5]:
-        tf[f"cast:{a.lower().replace(' ', '_')}"] += 2.0
-    # Keywords — context signal (1.0)
+        tf[f"cast:{a.lower().replace(' ', '_')}"] += 2.5
+    # Keywords — raised to 1.5 (more specific than genre)
     for kw in (movie.get("keywords") or [])[:15]:
-        tf[f"kw:{kw.lower().replace(' ', '_')}"] += 1.0
+        tf[f"kw:{kw.lower().replace(' ', '_')}"] += 1.5
     return dict(tf)
 
 
@@ -1408,17 +1503,36 @@ def _content_based_filter(user_id, all_ratings, movies_metadata):
     pref = _user_preference_vector(user_ratings, movies_metadata)
     if not pref:
         return {}
-    scores = {}
+
+    # First pass — collect all candidates and their raw CBF scores
+    raw_scores: dict = {}
+    genre_counts: dict = defaultdict(int)
+    total_candidates = 0
     for mid, movie in movies_metadata.items():
         if mid in user_ratings:
             continue
-        # Hard quality gate: don't score junk movies at all
         if not _passes_quality_gate(movie):
             continue
         s = _cosine_similarity(pref, _movie_feature_vector(movie))
-        # Minimum similarity threshold — sharing one genre barely qualifies; must be meaningfully similar
         if s >= MIN_CBF_SCORE:
-            scores[mid] = s
+            raw_scores[mid] = s
+            total_candidates += 1
+            for g in (movie.get("genres") or []):
+                if g:
+                    genre_counts[g] += 1
+
+    # Second pass — penalize catch-all genres that appear in >30% of the pool.
+    # This kills "Adventure" carpet-bombing when a user has rated one action/adventure film.
+    if total_candidates == 0:
+        return raw_scores
+    scores: dict = {}
+    for mid, s in raw_scores.items():
+        movie  = movies_metadata[mid]
+        penalty = 1.0
+        for g in (movie.get("genres") or []):
+            if g and genre_counts.get(g, 0) / total_candidates > 0.30:
+                penalty *= 0.65   # -35% per over-represented genre
+        scores[mid] = s * penalty
     return scores
 
 
@@ -1566,12 +1680,13 @@ def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N, 
     scored.sort(reverse=True)
 
     # ── Step 4: Build result list with diversity enforcement ──────────────────
-    results = []
+    # Primary list: top-scored candidates respecting franchise cap + title dedup
+    primary = []
     franchise_counts: dict = defaultdict(int)
     seen_title_keys = set()
 
     for final_score, mid, reason, candidate_franchises in scored[:top_n * 5]:
-        if len(results) >= top_n:
+        if len(primary) >= top_n:
             break
         movie = movies_metadata.get(mid)
         if not movie:
@@ -1588,7 +1703,7 @@ def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N, 
             franchise_counts[f] += 1
         seen_title_keys.add(title_key)
 
-        results.append({
+        primary.append({
             "movieId":     mid,
             "title":       movie.get("title", ""),
             "posterPath":  movie.get("posterPath"),
@@ -1599,9 +1714,53 @@ def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N, 
             "reason":      reason,
         })
 
+    # ── Diversity injection: every 5th slot gets an "exploration" pick ────────
+    # Find the top-2 dominant genres in primary list — anything not in those
+    # genres is eligible as an exploration pick, preventing filter bubbles.
+    if len(primary) >= 5:
+        genre_tally: dict = defaultdict(int)
+        for r in primary:
+            for g in r.get("genres", [])[:2]:
+                genre_tally[g] += 1
+        dominant = {g for g, _ in sorted(genre_tally.items(), key=lambda x: -x[1])[:2]}
+        primary_ids = {r["movieId"] for r in primary} | set(user_ratings)
+
+        # Gather exploration candidates: quality-gated movies outside dominant genres
+        explore_pool = []
+        for mid, movie in movies_metadata.items():
+            if mid in primary_ids:
+                continue
+            if not _passes_quality_gate(movie):
+                continue
+            movie_genres = set(movie.get("genres") or [])
+            if dominant and not (movie_genres & dominant):  # no overlap with dominant genres
+                explore_pool.append(movie)
+        explore_pool.sort(
+            key=lambda m: _quality_score(m), reverse=True
+        )
+        # Sample from top-40 so it's not always the same movies
+        explore_sample = random.sample(explore_pool[:40], min(4, len(explore_pool[:40])))
+
+        # Inject at every 5th position (indices 4, 9, 14, 19)
+        results = list(primary)
+        for i, exp_movie in enumerate(explore_sample):
+            slot = 4 + i * 5
+            if slot < len(results):
+                results.insert(slot, {
+                    "movieId":     exp_movie.get("movieId", ""),
+                    "title":       exp_movie.get("title", ""),
+                    "posterPath":  exp_movie.get("posterPath"),
+                    "genres":      exp_movie.get("genres", []),
+                    "voteAverage": float(exp_movie.get("voteAverage", 0)),
+                    "releaseYear": exp_movie.get("releaseYear", ""),
+                    "score":       round(_quality_score(exp_movie), 4),
+                    "reason":      "Explore something different",
+                })
+        results = results[:top_n]
+    else:
+        results = primary
+
     # ── Step 5: Top-up with quality popular only when almost nothing was found ─
-    # Keep threshold very low (3) so quality-popular movies don't flood a
-    # personalised list just because CBF/CF found fewer than top_n // 2 results.
     if len(results) < 3:
         exclude = set(user_ratings) | {r["movieId"] for r in results}
         results.extend(_quality_popular(movies_metadata, exclude, top_n - len(results), "Trending Now"))

@@ -4,14 +4,19 @@ import { useEffect, useState } from "react";
 import { useStore } from "@/lib/store";
 import { moviesApi } from "@/lib/api";
 import { MovieCard } from "@/components/MovieCard";
+import { OnboardingFlow } from "@/components/OnboardingFlow";
 import type { Movie, Recommendation } from "@/lib/types";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import toast from "react-hot-toast";
 
+const MIN_RATINGS_FOR_RECS = 5;
+
 export default function HomePage() {
   const { isAuthenticated, recommendations, recsLoading, recsFromCache, loadRecommendations, user, ratings, resetRatings } = useStore();
-  const hasRatings = Object.keys(ratings).length > 0;
+  const ratingCount = Object.keys(ratings).length;
+  const hasEnoughRatings = ratingCount >= MIN_RATINGS_FOR_RECS;
+  const hasRatings = ratingCount > 0;
 
   const handleStartFresh = async () => {
     if (!window.confirm("Remove all your ratings and start over? This cannot be undone.")) return;
@@ -25,6 +30,15 @@ export default function HomePage() {
       toast.error("Failed to reset ratings");
     }
   };
+
+  // Show onboarding if authenticated but not enough ratings yet
+  if (isAuthenticated && !hasEnoughRatings) {
+    return (
+      <OnboardingFlow
+        reason={hasRatings && ratingCount < MIN_RATINGS_FOR_RECS ? "ratings_dropped" : undefined}
+      />
+    );
+  }
   const [popular, setPopular] = useState<Movie[]>([]);
   const [hero, setHero] = useState<Movie | null>(null);
   const { setSelectedMovie } = useStore();
