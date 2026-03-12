@@ -11,6 +11,7 @@ import base64
 import json
 import math
 import os
+import random
 import threading
 import time
 from collections import defaultdict
@@ -1432,7 +1433,7 @@ def _normalise(scores):
 
 
 def _quality_popular(movies_metadata, exclude_ids: set, top_n: int, reason: str):
-    """Return top_n quality movies sorted by voteAverage × log(voteCount), excluding rated/already-listed."""
+    """Return top_n quality movies sampled from a wider quality pool so results vary on each call."""
     pool = [
         m for m in movies_metadata.values()
         if m["movieId"] not in exclude_ids and _passes_quality_gate(m)
@@ -1441,7 +1442,12 @@ def _quality_popular(movies_metadata, exclude_ids: set, top_n: int, reason: str)
         key=lambda m: float(m.get("voteAverage", 0)) * math.log1p(int(m.get("voteCount") or 0)),
         reverse=True,
     )
-    return _fmt_recs(pool[:top_n], reason)
+    # Use a wider bucket (top 3× or 60, whichever is larger) and sample randomly
+    # so every page/refresh shows a different slice of quality movies instead of
+    # always the same deterministic top-N (Lagaan, ZNMD, Interstellar…)
+    bucket = pool[:max(top_n * 3, 60)]
+    sample = random.sample(bucket, min(top_n, len(bucket)))
+    return _fmt_recs(sample, reason)
 
 
 def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N, implicit=None):
@@ -1504,7 +1510,8 @@ def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N, 
     impl_cbf_norm = _normalise(dict(implicit_cbf))
     impl_norm     = _normalise(implicit)
 
-    candidates = set(cf_norm) | set(cbf_norm) | set(impl_cbf_norm) | set(impl_norm)
+    # Exclude already-rated movies from every signal's candidate set
+    candidates = (set(cf_norm) | set(cbf_norm) | set(impl_cbf_norm) | set(impl_norm)) - set(user_ratings)
 
     if not candidates:
         return _quality_popular(movies_metadata, set(user_ratings), top_n, "Trending Now")
@@ -1583,8 +1590,10 @@ def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N, 
             "reason":      reason,
         })
 
-    # ── Step 5: Top-up with quality popular if not enough candidates ──────────
-    if len(results) < top_n // 2:
+    # ── Step 5: Top-up with quality popular only when almost nothing was found ─
+    # Keep threshold very low (3) so quality-popular movies don't flood a
+    # personalised list just because CBF/CF found fewer than top_n // 2 results.
+    if len(results) < 3:
         exclude = set(user_ratings) | {r["movieId"] for r in results}
         results.extend(_quality_popular(movies_metadata, exclude, top_n - len(results), "Trending Now"))
 
