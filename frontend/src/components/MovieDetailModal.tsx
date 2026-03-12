@@ -5,6 +5,7 @@ import Image from "next/image";
 import { motion, AnimatePresence } from "framer-motion";
 import { useStore } from "@/lib/store";
 import { StarRating } from "./StarRating";
+import { eventsApi } from "@/lib/api";
 import type { Movie } from "@/lib/types";
 
 interface MovieDetailModalProps {
@@ -13,6 +14,11 @@ interface MovieDetailModalProps {
 }
 
 export function MovieDetailModal({ movie, onClose }: MovieDetailModalProps) {
+  // Track movie_view on mount
+  useEffect(() => {
+    eventsApi.track("movie_view", { movieId: movie.movieId, title: movie.title });
+  }, [movie.movieId]);  // eslint-disable-line react-hooks/exhaustive-deps
+
   // Close on Escape key
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };

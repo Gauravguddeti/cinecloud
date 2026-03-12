@@ -129,7 +129,16 @@ def init_db():
                     properties JSONB DEFAULT '{}',
                     created_at TIMESTAMP DEFAULT NOW()
                 );
+                CREATE TABLE IF NOT EXISTS implicit_signals (
+                    id         SERIAL PRIMARY KEY,
+                    user_id    TEXT NOT NULL,
+                    movie_id   TEXT NOT NULL,
+                    signal     TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
                 CREATE INDEX IF NOT EXISTS idx_ratings_user_id ON ratings(user_id);
+                CREATE INDEX IF NOT EXISTS idx_implicit_user ON implicit_signals(user_id);
+                CREATE INDEX IF NOT EXISTS idx_implicit_movie ON implicit_signals(movie_id);
                 CREATE INDEX IF NOT EXISTS idx_movies_popularity ON movies(popularity DESC);
                 CREATE INDEX IF NOT EXISTS idx_movies_title_lower ON movies(title_lower);
             """)
@@ -741,7 +750,8 @@ def recommendations_get(user_id):
     t0              = time.time()
     all_ratings     = _load_all_ratings()
     movies_metadata = _load_movies_metadata()
-    recs            = compute_recommendations(user_id, all_ratings, movies_metadata)
+    implicit        = _load_implicit_signals(user_id)
+    recs            = compute_recommendations(user_id, all_ratings, movies_metadata, implicit=implicit)
     elapsed         = round(time.time() - t0, 3)
     _cache_set(user_id, recs)
     return jsonify({"recommendations": recs, "userId": user_id,
@@ -756,7 +766,8 @@ def recommendations_refresh(user_id):
     _cache_invalidate(user_id)
     all_ratings     = _load_all_ratings()
     movies_metadata = _load_movies_metadata()
-    recs            = compute_recommendations(user_id, all_ratings, movies_metadata)
+    implicit        = _load_implicit_signals(user_id)
+    recs            = compute_recommendations(user_id, all_ratings, movies_metadata, implicit=implicit)
     _cache_set(user_id, recs)
     return jsonify({"recommendations": recs, "userId": user_id,
                     "fromCache": False, "count": len(recs)})
@@ -972,6 +983,13 @@ def events_track():
                 "INSERT INTO events (user_id, event_type, properties) VALUES (%s, %s, %s)",
                 (uid, body.get("eventType", ""), json.dumps(body.get("properties", {}))),
             )
+            event_type = body.get("eventType", "")
+            movie_id   = str(body.get("properties", {}).get("movieId", ""))
+            if event_type in {"movie_view", "search_click", "browse_hover"} and movie_id:
+                cur.execute(
+                    "INSERT INTO implicit_signals (user_id, movie_id, signal) VALUES (%s, %s, %s)",
+                    (uid, movie_id, event_type),
+                )
             conn.commit()
     except Exception as e:
         conn.rollback()
@@ -1070,13 +1088,22 @@ def _cache_invalidate(user_id):
 # =============================================================
 
 def _load_all_ratings():
+    """Load all ratings with temporal decay applied.
+    Recent ratings count more — decay 3% per month beyond 30 days.
+    Ratings older than 2 years get capped at 40% of original weight.
+    """
     ratings = defaultdict(dict)
     conn    = _get_conn()
+    now     = datetime.utcnow()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id, movie_id, rating FROM ratings")
-            for user_id, movie_id, rating in cur.fetchall():
-                ratings[user_id][movie_id] = float(rating)
+            cur.execute("SELECT user_id, movie_id, rating, updated_at FROM ratings")
+            for user_id, movie_id, rating, updated_at in cur.fetchall():
+                age_days = (now - updated_at).days if updated_at else 0
+                # Decay: full weight within 30 days, then -3%/month, floor at 0.4
+                months_old = max(0, (age_days - 30) / 30.0)
+                decay      = max(0.4, 1.0 - 0.03 * months_old)
+                ratings[user_id][movie_id] = float(rating) * decay
     finally:
         _put_conn(conn)
     return dict(ratings)
@@ -1094,6 +1121,39 @@ def _load_movies_metadata():
     finally:
         _put_conn(conn)
     return movies
+
+
+def _load_implicit_signals(user_id: str) -> dict:
+    """Load implicit event weights for a user: movie_id → score.
+    Signals and weights:
+      movie_view       → 1.0  (opened detail modal)
+      search_click     → 0.7  (clicked search result)
+      browse_hover     → 0.3  (hovered on poster ≥ 2s)
+    Recency decay: same 3%/month formula as ratings.
+    Returns normalised dict (max = 1.0).
+    """
+    SIGNAL_WEIGHTS = {"movie_view": 1.0, "search_click": 0.7, "browse_hover": 0.3}
+    raw: dict = defaultdict(float)
+    conn      = _get_conn()
+    now       = datetime.utcnow()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT movie_id, signal, created_at FROM implicit_signals WHERE user_id = %s",
+                (user_id,),
+            )
+            for movie_id, signal, created_at in cur.fetchall():
+                w          = SIGNAL_WEIGHTS.get(signal, 0.3)
+                age_days   = (now - created_at).days if created_at else 0
+                months_old = max(0, (age_days - 7) / 30.0)   # grace period: 7 days
+                decay      = max(0.2, 1.0 - 0.05 * months_old)
+                raw[movie_id] += w * decay
+    finally:
+        _put_conn(conn)
+    if not raw:
+        return {}
+    max_val = max(raw.values())
+    return {mid: v / max_val for mid, v in raw.items()}
 
 
 # =============================================================
@@ -1174,12 +1234,13 @@ def _enrich_and_recompute(user_id: str, movie_id: str):
 
 
 def _recompute_recs(user_id):
-    """Background thread worker."""
+    """Background thread worker — loads all data including implicit signals."""
     try:
         _cache_invalidate(user_id)
-        recs = compute_recommendations(user_id, _load_all_ratings(), _load_movies_metadata())
+        implicit = _load_implicit_signals(user_id)
+        recs = compute_recommendations(user_id, _load_all_ratings(), _load_movies_metadata(), implicit=implicit)
         _cache_set(user_id, recs)
-        print(f"[worker] {len(recs)} recs for {user_id} written to DB")
+        print(f"[worker] {len(recs)} recs for {user_id} (implicit signals: {len(implicit)})")
     except Exception as e:
         print(f"[worker] Error for {user_id}: {e}")
 
@@ -1383,52 +1444,101 @@ def _quality_popular(movies_metadata, exclude_ids: set, top_n: int, reason: str)
     return _fmt_recs(pool[:top_n], reason)
 
 
-def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N):
+def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N, implicit=None):
+    """
+    5-signal hybrid recommendation engine:
+      1. Collaborative filtering (CF)       — what similar users liked
+      2. Content-based filtering (CBF)      — genres / cast / keywords match
+      3. Franchise affinity                 — MCU/DC/LOTR/Bollywood star loyalty
+      4. Implicit behaviour signals         — what you viewed / searched / hovered
+      5. Quality gating                     — drop junk, boost well-rated films
+
+    Final score = 0.55*relevance + 0.15*quality + 0.15*franchise + 0.15*implicit
+    """
+    if implicit is None:
+        implicit = {}
     user_ratings = all_ratings.get(user_id, {})
-    if not user_ratings:
+    if not user_ratings and not implicit:
         return _quality_popular(movies_metadata, set(), top_n, "Popular on CineCloud")
 
     # ── Step 1: Build franchise affinity from highly-rated movies ─────────────
-    # Accumulate franchise weight from movies rated ≥ 4 stars
     user_franchises: dict = defaultdict(float)
     for mid, rating in user_ratings.items():
         movie = movies_metadata.get(mid)
-        if not movie or rating < 4:
+        if not movie:
             continue
-        for fkey in _detect_franchise(movie):
-            user_franchises[fkey] += (rating - 3.0)  # 1 for 4★, 2 for 5★
+        # Only movies rated 4+ contribute to franchise affinity (like signals)
+        if rating >= 4:
+            for fkey in _detect_franchise(movie):
+                user_franchises[fkey] += (rating - 3.0)
+        # Also pull franchise from highly-interacted movies (implicit ≥ 0.5)
+    for mid, iscore in implicit.items():
+        if iscore >= 0.5:
+            movie = movies_metadata.get(mid)
+            if movie:
+                for fkey in _detect_franchise(movie):
+                    user_franchises[fkey] += iscore * 0.5  # implicit counts half of a 4★
 
-    # ── Step 2: Run collaborative + content-based filters ─────────────────────
+    # ── Step 2: Run CF + CBF ───────────────────────────────────────────────────
     cf_norm  = _normalise(_collaborative_filter(user_id, all_ratings))
     cbf_norm = _normalise(_content_based_filter(user_id, all_ratings, movies_metadata))
-    candidates = set(cf_norm) | set(cbf_norm)
+
+    # Implicit boosts extra candidates: movies the user interacted with but hasn't rated
+    # Expand candidate pool with movies similar to implicitly-viewed ones
+    implicit_cbf: dict = defaultdict(float)
+    for mid, iscore in implicit.items():
+        if mid in user_ratings:
+            continue
+        ref_movie = movies_metadata.get(mid)
+        if not ref_movie or not _passes_quality_gate(ref_movie):
+            continue
+        ref_vec = _movie_feature_vector(ref_movie)
+        for cand_id, cand_movie in movies_metadata.items():
+            if cand_id in user_ratings or cand_id == mid:
+                continue
+            if not _passes_quality_gate(cand_movie):
+                continue
+            s = _cosine_similarity(ref_vec, _movie_feature_vector(cand_movie))
+            if s >= MIN_CBF_SCORE:
+                implicit_cbf[cand_id] += s * iscore
+    impl_cbf_norm = _normalise(dict(implicit_cbf))
+    impl_norm     = _normalise(implicit)
+
+    candidates = set(cf_norm) | set(cbf_norm) | set(impl_cbf_norm) | set(impl_norm)
 
     if not candidates:
         return _quality_popular(movies_metadata, set(user_ratings), top_n, "Trending Now")
 
-    # ── Step 3: Score every candidate with multi-signal blend ─────────────────
+    # ── Step 3: Score every candidate ─────────────────────────────────────────
     scored = []
     for mid in candidates:
         movie = movies_metadata.get(mid)
         if not movie or not _passes_quality_gate(movie):
             continue
 
-        relevance = cf_norm.get(mid, 0) * CF_WEIGHT + cbf_norm.get(mid, 0) * CBF_WEIGHT
-        quality   = _quality_score(movie)
+        relevance      = cf_norm.get(mid, 0) * CF_WEIGHT + cbf_norm.get(mid, 0) * CBF_WEIGHT
+        quality        = _quality_score(movie)
+        implicit_score = max(impl_norm.get(mid, 0), impl_cbf_norm.get(mid, 0))
 
-        # Franchise affinity boost: how strongly does this movie match user's franchise love?
         candidate_franchises = _detect_franchise(movie)
-        raw_boost   = sum(user_franchises.get(f, 0) for f in candidate_franchises)
-        franchise_norm = min(raw_boost / 5.0, 1.0)  # normalise, cap at 1.0
+        raw_boost      = sum(user_franchises.get(f, 0) for f in candidate_franchises)
+        franchise_norm = min(raw_boost / 5.0, 1.0)
 
-        # Final blend: 60% relevance + 20% quality + 20% franchise affinity
-        final_score = relevance * 0.60 + quality * 0.20 + franchise_norm * 0.20
+        # Final blend: relevance 55% | quality 15% | franchise 15% | implicit 15%
+        final_score = (
+            relevance      * 0.55 +
+            quality        * 0.15 +
+            franchise_norm * 0.15 +
+            implicit_score * 0.15
+        )
 
         # ── Reason string ──────────────────────────────────────────────────────
         if candidate_franchises and any(f in user_franchises for f in candidate_franchises):
             matched_f = next(f for f in candidate_franchises if f in user_franchises)
             label     = _FRANCHISE_LABELS.get(matched_f)
             reason    = f"More from the {label}" if label else "More from a franchise you love"
+        elif implicit_score > 0.5 and relevance < 0.3:
+            reason = "Because you explored similar movies"
         elif cf_norm.get(mid, 0) > cbf_norm.get(mid, 0):
             reason = "Fans of your rated movies loved this"
         else:
@@ -1451,12 +1561,10 @@ def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N):
         if not movie:
             continue
 
-        # Deduplicate by normalised title prefix (avoids same movie under different IDs)
         title_key = (movie.get("titleLower") or "")[:30]
         if title_key in seen_title_keys:
             continue
 
-        # Franchise diversity cap: no more than MAX_PER_FRANCHISE entries per series
         if any(franchise_counts[f] >= MAX_PER_FRANCHISE for f in candidate_franchises):
             continue
 
@@ -1475,7 +1583,7 @@ def compute_recommendations(user_id, all_ratings, movies_metadata, top_n=TOP_N):
             "reason":      reason,
         })
 
-    # ── Step 5: Top-up with quality popular if algorithm produced too few ──────
+    # ── Step 5: Top-up with quality popular if not enough candidates ──────────
     if len(results) < top_n // 2:
         exclude = set(user_ratings) | {r["movieId"] for r in results}
         results.extend(_quality_popular(movies_metadata, exclude, top_n - len(results), "Trending Now"))

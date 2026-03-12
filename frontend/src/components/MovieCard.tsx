@@ -1,7 +1,9 @@
 "use client";
 
 import Image from "next/image";
+import { useRef } from "react";
 import { useStore } from "@/lib/store";
+import { eventsApi } from "@/lib/api";
 import type { Movie } from "@/lib/types";
 import { StarRating } from "./StarRating";
 import clsx from "clsx";
@@ -16,6 +18,17 @@ interface MovieCardProps {
 export function MovieCard({ movie, showRating = true, reason, className }: MovieCardProps) {
   const { setSelectedMovie, ratings } = useStore();
   const userRating = ratings[movie.movieId];
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleMouseEnter = () => {
+    hoverTimer.current = setTimeout(() => {
+      eventsApi.track("browse_hover", { movieId: movie.movieId, title: movie.title });
+    }, 2000);
+  };
+
+  const handleMouseLeave = () => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+  };
 
   return (
     <div
@@ -24,6 +37,8 @@ export function MovieCard({ movie, showRating = true, reason, className }: Movie
       role="button"
       tabIndex={0}
       onKeyDown={(e) => e.key === "Enter" && setSelectedMovie(movie)}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
       aria-label={`View ${movie.title}`}
     >
       {/* Poster */}

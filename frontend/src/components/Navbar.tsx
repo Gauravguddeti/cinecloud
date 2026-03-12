@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useState, useRef, useCallback } from "react";
 import { useStore } from "@/lib/store";
 import { useRouter, usePathname } from "next/navigation";
-import { moviesApi } from "@/lib/api";
+import { moviesApi, eventsApi } from "@/lib/api";
 import type { Movie } from "@/lib/types";
 import clsx from "clsx";
 import { useClerk } from "@clerk/nextjs";
@@ -93,7 +93,12 @@ export function Navbar() {
               {searchResults.map((movie) => (
                 <button
                   key={movie.movieId}
-                  onClick={() => { setSelectedMovie(movie); setSearchResults([]); setSearchQuery(""); }}
+                  onClick={() => {
+                    eventsApi.track("search_click", { movieId: movie.movieId, title: movie.title });
+                    setSelectedMovie(movie);
+                    setSearchResults([]);
+                    setSearchQuery("");
+                  }}
                   className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-white/5 text-left transition-colors"
                 >
                   {movie.posterPath ? (
