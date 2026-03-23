@@ -22,7 +22,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <ClerkProvider
       signInUrl="/login"
       signUpUrl="/register"
-      fallbackRedirectUrl="/"
+      signInFallbackRedirectUrl="/"
+      signUpFallbackRedirectUrl="/"
     >
       <html lang="en" className="dark">
         <body className={`${inter.variable} font-sans bg-brand-dark text-white min-h-screen`}>
