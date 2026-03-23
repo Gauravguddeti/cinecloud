@@ -94,7 +94,7 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id    TEXT PRIMARY KEY,
-                    email      TEXT UNIQUE NOT NULL,
+                    email      TEXT NOT NULL,
                     name       TEXT DEFAULT '',
                     created_at TIMESTAMP DEFAULT NOW()
                 );
@@ -153,6 +153,10 @@ def init_db():
             """)
             # Fuzzy search — safe to run multiple times
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+            # Older schema had UNIQUE(email) which can break Clerk re-login flows
+            # (same email from a new Clerk subject id) and cause /auth/sync 500.
+            # Drop the unique constraint for auth robustness in this project.
+            cur.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_movies_title_trgm ON movies USING gin(title_lower gin_trgm_ops);")
             # Clean up null genre elements left by old code (safe to run repeatedly)
             cur.execute("""
@@ -313,6 +317,7 @@ def auth_sync():
         return jsonify({"user": _user_resp(user)})
     except Exception as e:
         conn.rollback()
+        print(f"[auth/sync] error for uid={uid} email={email}: {e}")
         return jsonify({"error": str(e)}), 500
     finally:
         _put_conn(conn)
