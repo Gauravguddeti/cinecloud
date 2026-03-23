@@ -10,7 +10,7 @@ import clsx from "clsx";
 import { useClerk } from "@clerk/nextjs";
 
 export function Navbar() {
-  const { isAuthenticated, user } = useStore();
+  const { isAuthenticated, user, setUser } = useStore();
   const { signOut } = useClerk();
   const router = useRouter();
   const pathname = usePathname();
@@ -40,8 +40,11 @@ export function Navbar() {
     }, 250);
   }, []);
 
-  const handleLogout = () => {
-    signOut(() => router.push("/"));
+  const handleLogout = async () => {
+    setUser(null);
+    localStorage.removeItem("accessToken");
+    await signOut({ redirectUrl: "/login" });
+    router.push("/login");
   };
 
   return (

@@ -17,6 +17,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const { getToken } = useAuth();
   const { setUser, user, selectedMovie, setSelectedMovie, loadRatings, loadRecommendations } = useStore();
 
+  const fallbackUserFromClerk = () => {
+    if (!clerkUser) return null;
+    return {
+      userId: clerkUser.id,
+      email: clerkUser.primaryEmailAddress?.emailAddress ?? "",
+      name: clerkUser.fullName ?? clerkUser.firstName ?? "",
+    };
+  };
+
   // Register Clerk's getToken so every axios request gets a fresh JWT (prevents expiry redirects)
   useEffect(() => {
     setTokenProvider(getToken);
@@ -31,10 +40,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
+    // Keep app auth state aligned with Clerk immediately to avoid login-page bounce
+    // when backend sync is still in-flight or temporarily failing.
+    const provisional = fallbackUserFromClerk();
+    if (provisional) setUser(provisional as any);
+
     (async () => {
       try {
-        const token = await getToken();
-        if (!token) return;
+        let token = await getToken();
+        if (!token) {
+          await new Promise((r) => setTimeout(r, 250));
+          token = await getToken({ skipCache: true } as any);
+        }
+        if (!token) {
+          console.warn("[AppProvider] Clerk token unavailable; keeping provisional user state.");
+          return;
+        }
         localStorage.setItem("accessToken", token);
 
         const email = clerkUser.primaryEmailAddress?.emailAddress ?? "";
@@ -43,7 +64,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setUser(data.user);
       } catch (err) {
         console.error("[AppProvider] sync failed:", err);
-        setUser(null);
+        // Do not force-logout UI when Clerk session is valid but backend sync failed.
+        const fallback = fallbackUserFromClerk();
+        if (fallback) setUser(fallback as any);
       }
     })();
   }, [isLoaded, isSignedIn, clerkUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
