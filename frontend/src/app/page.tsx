@@ -14,6 +14,10 @@ const MIN_RATINGS_FOR_RECS = 5;
 
 export default function HomePage() {
   const { isAuthenticated, recommendations, recsLoading, recsFromCache, loadRecommendations, user, ratings, resetRatings } = useStore();
+  const [popular, setPopular] = useState<Movie[]>([]);
+  const [hero, setHero] = useState<Movie | null>(null);
+  const { setSelectedMovie } = useStore();
+
   const ratingCount = Object.keys(ratings).length;
   const hasEnoughRatings = ratingCount >= MIN_RATINGS_FOR_RECS;
   const hasRatings = ratingCount > 0;
@@ -31,18 +35,6 @@ export default function HomePage() {
     }
   };
 
-  // Show onboarding if authenticated but not enough ratings yet
-  if (isAuthenticated && !hasEnoughRatings) {
-    return (
-      <OnboardingFlow
-        reason={hasRatings && ratingCount < MIN_RATINGS_FOR_RECS ? "ratings_dropped" : undefined}
-      />
-    );
-  }
-  const [popular, setPopular] = useState<Movie[]>([]);
-  const [hero, setHero] = useState<Movie | null>(null);
-  const { setSelectedMovie } = useStore();
-
   useEffect(() => {
     moviesApi.popular(20).then(({ data }) => {
       setPopular(data.movies);
@@ -53,6 +45,15 @@ export default function HomePage() {
   useEffect(() => {
     if (isAuthenticated) loadRecommendations();
   }, [isAuthenticated, loadRecommendations]);
+
+  // Show onboarding if authenticated but not enough ratings yet
+  if (isAuthenticated && !hasEnoughRatings) {
+    return (
+      <OnboardingFlow
+        reason={hasRatings && ratingCount < MIN_RATINGS_FOR_RECS ? "ratings_dropped" : undefined}
+      />
+    );
+  }
 
   return (
     <div className="min-h-screen">
