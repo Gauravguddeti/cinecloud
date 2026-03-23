@@ -7,10 +7,11 @@ import { useRouter, usePathname } from "next/navigation";
 import { moviesApi, eventsApi } from "@/lib/api";
 import type { Movie } from "@/lib/types";
 import clsx from "clsx";
-import { useClerk } from "@clerk/nextjs";
+import { useClerk, useUser } from "@clerk/nextjs";
 
 export function Navbar() {
   const { isAuthenticated, user, setUser } = useStore();
+  const { isSignedIn } = useUser();
   const { signOut } = useClerk();
   const router = useRouter();
   const pathname = usePathname();
@@ -20,6 +21,7 @@ export function Navbar() {
   const { setSelectedMovie } = useStore();
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const effectiveSignedIn = !!isSignedIn || isAuthenticated;
 
   const handleSearch = useCallback((q: string) => {
     setSearchQuery(q);
@@ -59,7 +61,7 @@ export function Navbar() {
         <div className="hidden md:flex items-center gap-5 text-sm font-medium">
           <NavLink href="/" active={pathname === "/"}>Home</NavLink>
           <NavLink href="/browse" active={pathname === "/browse"}>Browse</NavLink>
-          {isAuthenticated && (
+          {effectiveSignedIn && (
             <NavLink href="/profile" active={pathname === "/profile"}>My List</NavLink>
           )}
         </div>
@@ -120,7 +122,7 @@ export function Navbar() {
         </div>
 
         {/* Auth actions */}
-        {isAuthenticated ? (
+        {effectiveSignedIn ? (
           <div className="flex items-center gap-3 shrink-0">
             <span className="hidden md:block text-sm text-gray-300">
               Hi, {user?.name?.split(" ")[0] || "User"}
